@@ -2328,9 +2328,9 @@ var qrcode = function() {
 // 以下为 WeChat Diary 插件本体。文件末尾的 module.exports 覆盖上方 UMD 段的赋值。
 // ═══════════════════════════════════════════════════════════════════════
 
-const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform, AbstractInputSuggest } = require("obsidian");
+const { Plugin, PluginSettingTab, Setting, Modal, Notice, normalizePath, requestUrl, Platform, AbstractInputSuggest, moment } = require("obsidian");
 
-const PLUGIN_VERSION = "0.3.0";
+const PLUGIN_VERSION = "0.4.1";
 const AGENT_NAME = "obsidian-wechat-diary";
 const BOT_AGENT = AGENT_NAME + "/" + PLUGIN_VERSION;
 const CHANNEL_VERSION = "2.4.6";               // 对齐官方 @tencent-weixin/openclaw-weixin
@@ -2362,6 +2362,19 @@ const OFFLINE_NOTICE_GAP_H = 24;   // 缓冲窗口 24h 内实测可补收(2026-0
 
 const DEFAULT_SETTINGS = {
   diaryFolder: "日记",
+  // 默认只抓公众号链接；其它站点需用户主动打开扩展开关。
+  webClipEnabled: true,
+  webClipOtherSites: false,
+  // 空值表示跟随 <日记文件夹>/剪藏；用户填入后才固定为自定义目录。
+  webClipFolder: "",
+  // 只下载正文容器里的栅格图, 落进剪藏附件目录并改写为本地 Obsidian embed。
+  webClipSaveImages: true,
+  webClipMaxImages: 30,
+  webClipMaxTotalImageMb: 50,
+  // 防异常网页把 vault 撑爆。约 20 万汉字已远超通常长文, 超出部分会明确标注截断。
+  webClipMaxChars: 200000,
+  // 先落原始消息并立即回执，正文抓取放进串行后台队列，避免慢网页堵住微信长轮询。
+  webClipBackground: true,
   timezone: "Asia/Shanghai",
   aiApiUrl: "",
   aiModel: "",
@@ -2377,7 +2390,76 @@ const DEFAULT_SETTINGS = {
   // 保存语音原声(D12, 2026-08-20 谷雨拍板: 开关型、默认关): 开了之后语音消息 = 原声 wav + 转写文字同块,
   // 桌面端渲染成微信样式的语音气泡(点击即播)。默认关: 文字为主, 音频约 3MB/分钟计入库体积且被同步盘带走。
   saveVoiceAudio: false,
+  // #15 / D13 (2026-08-30): 路径可配置 + 写进已有的每日笔记。默认值渲染结果与 0.3.1 逐字相同(bindtest【G】黄金回归盯着)。
+  pathFormat: "YYYY/YYYY-MM-DD",   // moment 格式, 相对日记文件夹; 英文字母是日期代码, 文件夹名放 [方括号]
+  attachmentMode: "diary",         // diary(日记文件夹内 attachments/YYYY, 现状) | obsidian(跟随 Obsidian 附件设置) | custom(下面的文件夹)
+  attachmentFolder: "",            // custom 模式的附件文件夹(库里选的文件夹路径; "/" = 库根目录)
+  attachmentSubFormat: "",         // custom 模式下按日期分的子文件夹, moment 格式(如 YYYY/MM), 可空
+  sharedDailyNote: false,          // 开: 不单独建文件, 写进当天每日笔记末尾的「## <sectionHeading>」一节, 插件只动这一节
+  sectionHeading: "微信随手记",     // 节标题文字(不含 ##, 级别固定二级)
+  templatePath: "",                // 共用模式下当天文件不存在时用的模板(vault 内 .md 路径; 空 = 只建我们那一节)
 };
+
+const UNSUPPORTED_FORWARD_REPLY = "这类微信内容暂时不能完整读取，可能是公众号卡片、合并聊天记录、小程序或位置。原消息已记为待补充；请复制文字或链接重新发送，文件请进入本对话后直接发送。";
+const UNKNOWN_MESSAGE_HISTORY_LIMIT = 20;
+const ILINK_INTERNAL_ITEM_TYPES = new Set([0, 11, 12]);
+
+function compactQuotedText(value) {
+  return String(value || "").replace(/\r\n?/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function quoteMarkdown(text, label) {
+  const body = compactQuotedText(text);
+  if (!body) return "";
+  return "> [!quote] " + (label || "微信引用") + "\n" + body.split("\n").map((line) => "> " + line).join("\n");
+}
+
+// iLink 的 ref_msg 尚无稳定公开样例；兼容官方字段和常见 proto/json 包装，
+// 只读取展示所需文本与媒体种类，不把 token、CDN key 等协议字段写进笔记。
+function extractRefMessage(ref) {
+  if (!ref || typeof ref !== "object") return null;
+  const texts = [];
+  const media = [];
+  const seen = new Set();
+  const visit = (node, depth) => {
+    if (!node || typeof node !== "object" || depth > 5 || seen.has(node)) return;
+    seen.add(node);
+    if (typeof node.text === "string" && node.text.trim()) texts.push(node.text.trim());
+    if (node.text_item && typeof node.text_item.text === "string" && node.text_item.text.trim()) texts.push(node.text_item.text.trim());
+    if (node.voice_item) {
+      if (typeof node.voice_item.text === "string" && node.voice_item.text.trim()) texts.push(node.voice_item.text.trim());
+      else media.push("语音");
+    }
+    if (node.image_item) media.push("图片");
+    if (node.file_item) media.push("文件" + (node.file_item.file_name ? "：" + node.file_item.file_name : ""));
+    if (node.video_item) media.push("视频");
+    for (const key of ["item_list", "items", "msg", "message", "content", "ref_msg"]) {
+      const child = node[key];
+      if (Array.isArray(child)) child.forEach((x) => visit(x, depth + 1));
+      else visit(child, depth + 1);
+    }
+  };
+  visit(ref, 0);
+  const uniqueText = [...new Set(texts.map(compactQuotedText).filter(Boolean))];
+  const uniqueMedia = [...new Set(media)];
+  if (!uniqueText.length && !uniqueMedia.length) return null;
+  const parts = uniqueText.slice(0, 3);
+  if (uniqueMedia.length) parts.push("[引用的" + uniqueMedia.join("、") + "]");
+  return { text: parts.join("\n\n"), media: uniqueMedia };
+}
+
+function unknownMessageSummary(msg, unknownItems) {
+  return {
+    at: new Date().toISOString(),
+    messageType: Number.isFinite(Number(msg && msg.message_type)) ? Number(msg.message_type) : null,
+    messageState: Number.isFinite(Number(msg && msg.message_state)) ? Number(msg.message_state) : null,
+    itemTypes: (unknownItems || []).map((item) => Number.isFinite(Number(item && item.type)) ? Number(item.type) : null),
+    itemKeys: (unknownItems || []).map((item) => item && typeof item === "object"
+      ? Object.keys(item).filter((key) => !/token|key|url|media|content|text/i.test(key)).slice(0, 12)
+      : []),
+    hasRef: (msg && Array.isArray(msg.item_list)) ? msg.item_list.some((item) => Boolean(item && (item.ref_msg || (item.text_item && item.text_item.ref_msg)))) : false,
+  };
+}
 
 // ── 北京时间工具(019 config.py 的教训: 禁止裸用宿主机本地时间)─────────
 
@@ -2598,10 +2680,33 @@ const FINALIZE_EMPTY_REPLY = "今天还没记东西呢~ 想记什么直接发";
 const FINALIZE_FAIL_REPLY = "⚠️ 收尾标记没写上! 写入出了问题, 等一会儿再试";
 // 跨天后的第一条: 昨天已自动封存的告知(会替掉 FIRST_OF_DAY_PREFIX, 两句语义重复)
 const GRACE_EXPIRED_NOTICE = "(昨天的已自动收尾, 翻开新的一页 📖)";
+// 共用模式(#15): 文件是用户的每日笔记, 开页语/跨天语带逻辑日日期——凌晨落进"昨天"的文件时一眼能看出
+function firstOfDayPrefixShared(day, heading) { return "今天的第一条记录, 记进 " + day + " 的每日笔记「" + heading + "」一节了 📖\n"; }
+const FIRST_OF_DAY_PREFIX_SHARED_RE = /^今天的第一条记录, 记进 \d{4}-\d{2}-\d{2} 的每日笔记「[\s\S]*?」一节了 📖\n/;
+function stripFirstPrefix(reply) { return String(reply || "").replace(FIRST_OF_DAY_PREFIX, "").replace(FIRST_OF_DAY_PREFIX_SHARED_RE, ""); }
+function expiredNoticeShared(day) { return "(" + day + " 的已自动收尾 📖)"; }
+const UNDO_FOREIGN_REPLY = "这个文件里没有微信记的内容可撤, 要删请到 Obsidian 里手动删";
+function welcomeTextShared(heading) {
+  return `嗨~ 我是你的随手记 Agent ✍️
+
+想记什么直接发给我, 文字、语音、图片、文件都行, 我会记到你今天的笔记里。
+记的东西在你每天的每日笔记里, 「${heading}」这一节; 想换地方: Obsidian 设置 → 第三方插件 → WeChat Diary。
+说错了发「撤回」, 随时发「帮助」看全部用法。`;
+}
+function helpText(shared, heading, dayStartHour) {
+  let t = HELP_TEXT;
+  const h = Number(dayStartHour);
+  // 「一天从几点开始」改过的用户, 帮助里那句不能还写死 4 点(默认 4 时输出与常量逐字相同)
+  if (h === 0) t = t.replace("熬夜不怕跨天: 凌晨 4 点前记的都算前一天。", "一天从零点切换(设置里改的), 不做熬夜合并。");
+  else if (Number.isInteger(h) && h !== 4) t = t.replace("凌晨 4 点前记的都算前一天", "凌晨 " + h + " 点前记的都算前一天");
+  if (!shared) return t;
+  return t + "\n\n「" + heading + "」这一节归插件管: 撤回、段数都只看这一节; 节下面写任何标题就算节结束。";
+}
 
 // 撤回回执带被撤内容预览: 用户要能确认撤对了。纯字符串, 不需要 AI。
 function undoOkReply(removed) {
   if (!removed) return "好的, 帮你撤回啦";
+  if (/\[\[[^\]\n]+\|🔖\s/.test(removed)) return "好的, 撤掉了刚才那条网页，剪藏文件还在";
   if (removed.startsWith("🎤 ![[")) return "好的, 撤掉了刚才那条语音";
   if (removed.startsWith("![[")) {
     const low = removed.toLowerCase();
@@ -3136,11 +3241,970 @@ class ChatHandler {
   }
 }
 
+// ── 网页正文剪藏(纯本地规则, 不调用 AI)──────────────────────────────────
+
+const WEB_CLIP_FETCH_TIMEOUT_MS = 30000;
+const WEB_CLIP_IMAGE_TIMEOUT_MS = 10000;
+const WEB_CLIP_TOTAL_BUDGET_MS = 75000;
+const WEB_CLIP_IMAGE_CONCURRENCY = 4;
+const WEB_CLIP_MAX_HTML_BYTES = 5 * 1024 * 1024;
+const WEB_CLIP_MAX_IMAGE_BYTES = 15 * 1024 * 1024;
+const WEB_CLIP_DEFAULT_MAX_IMAGES = 30;
+const WEB_CLIP_HARD_MAX_IMAGES = 100;
+const WEB_CLIP_DEFAULT_MAX_TOTAL_IMAGE_MB = 50;
+const WEB_CLIP_MIN_TOTAL_IMAGE_MB = 15;
+const WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB = 500;
+const WEB_CLIP_MAX_LINKS_PER_MESSAGE = 3;
+const WEB_CLIP_MIN_TEXT_CHARS = 40;
+const WEB_URL_RE = /https?:\/\/[^\s<>"'，。！？；：、（）【】《》「」『』〔〕〈〉]+/gi;
+const WEB_CLIP_BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36";
+
+function defaultWebClipFolder(settings) {
+  return normalizePath(((settings && settings.diaryFolder) || "日记") + "/剪藏");
+}
+
+function webClipMaxImages(settings) {
+  const configured = Number(settings && settings.webClipMaxImages);
+  return Number.isFinite(configured)
+    ? Math.max(0, Math.min(WEB_CLIP_HARD_MAX_IMAGES, Math.floor(configured)))
+    : WEB_CLIP_DEFAULT_MAX_IMAGES;
+}
+
+function webClipMaxTotalImageBytes(settings) {
+  const configured = Number(settings && settings.webClipMaxTotalImageMb);
+  const mb = Number.isFinite(configured)
+    ? Math.max(WEB_CLIP_MIN_TOTAL_IMAGE_MB, Math.min(WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB, Math.floor(configured)))
+    : WEB_CLIP_DEFAULT_MAX_TOTAL_IMAGE_MB;
+  return mb * 1024 * 1024;
+}
+
+function normalizeWebUrl(raw) {
+  try {
+    const u = new URL(String(raw || "").trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (u.username || u.password) return null;
+    u.hash = ""; // 页面锚点不影响正文, 去掉后同一篇文章可稳定去重
+    return u.toString();
+  } catch (e) { return null; }
+}
+
+function isWechatArticleUrl(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized) return false;
+  try {
+    const u = new URL(normalized);
+    const host = u.hostname.toLowerCase();
+    if (host === "mp.weixin.qq.com") return true;
+    // 微信“搜一搜/问一问”分享的是官方短跳转，不是 mp 正文地址。
+    return host === "search.weixin.qq.com" &&
+      u.pathname === "/cgi-bin/newsearchweb/zhugeshortjump" && Boolean(u.searchParams.get("key"));
+  }
+  catch (e) { return false; }
+}
+
+function isWechatShortJumpUrl(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized) return false;
+  try {
+    const u = new URL(normalized);
+    return u.hostname.toLowerCase() === "search.weixin.qq.com" &&
+      u.pathname === "/cgi-bin/newsearchweb/zhugeshortjump" && Boolean(u.searchParams.get("key"));
+  } catch (e) { return false; }
+}
+
+function classifyWechatJumpLocation(rawLocation, sourceUrl) {
+  if (!rawLocation) return { kind: "unknown", url: "" };
+  let u;
+  try { u = new URL(String(rawLocation), normalizeWebUrl(sourceUrl) || "https://search.weixin.qq.com/"); }
+  catch (e) { return { kind: "unknown", url: "" }; }
+  const host = u.hostname.toLowerCase();
+  if (host === "mp.weixin.qq.com") return { kind: "article", url: u.toString() };
+  if (host !== "search.weixin.qq.com") return { kind: "external", url: u.toString() };
+  const pagePath = u.searchParams.get("path") || "";
+  if (pagePath === "page/ask/index" || /\/pages\/question\/entry/i.test(u.hash)) {
+    return { kind: "ask", url: u.toString() };
+  }
+  return { kind: "wechat_internal", url: u.toString() };
+}
+
+function resolveWechatShortJump(rawUrl, timeoutMs) {
+  const url = normalizeWebUrl(rawUrl);
+  if (!isWechatShortJumpUrl(url)) return Promise.resolve({ kind: "article", url });
+  const https = getHttps();
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let req;
+    let timer;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) window.clearTimeout(timer);
+      fn(value);
+    };
+    try {
+      req = https.request(new URL(url), {
+        method: "GET",
+        headers: { Accept: "text/html,*/*;q=0.5", "User-Agent": WEB_CLIP_BROWSER_UA },
+      }, (res) => {
+        const location = res.headers.location || "";
+        res.resume();
+        if (Number(res.statusCode) >= 300 && Number(res.statusCode) < 400 && location) {
+          done(resolve, classifyWechatJumpLocation(location, url));
+          return;
+        }
+        done(resolve, { kind: "article", url }); // 无302时仍允许原抓取层尝试
+      });
+      timer = window.setTimeout(() => {
+        try { req.destroy(); } catch (e) { /* noop */ }
+        done(reject, new Error("微信短链接解析超时"));
+      }, Math.max(1, Number(timeoutMs) || 10000));
+      req.on("error", (e) => done(reject, e));
+      req.end();
+    } catch (e) { done(reject, e); }
+  });
+}
+
+function shouldClipWebUrl(raw, settings) {
+  return isWechatArticleUrl(raw) || Boolean(settings && settings.webClipOtherSites === true);
+}
+
+function trimUrlTail(raw) {
+  let s = String(raw || "");
+  // 中文闭合标点和句末标点不会是 URL 的合法必要尾巴。
+  s = s.replace(/[，。！？；：、）】》」』〕〉]+$/g, "");
+  s = s.replace(/[.,!?;:]+$/g, "");
+  // 英文右括号只有在数量多于左括号时才当聊天标点剥掉, 保住 Wikipedia 常见的 (...) URL。
+  while (s.endsWith(")") && (s.match(/\)/g) || []).length > ((s.match(/\(/g) || []).length)) s = s.slice(0, -1);
+  return s;
+}
+
+function extractWebUrls(text) {
+  const out = [];
+  const seen = new Set();
+  for (const m of String(text || "").matchAll(WEB_URL_RE)) {
+    const u = normalizeWebUrl(trimUrlTail(m[0]));
+    if (u && !seen.has(u)) { seen.add(u); out.push(u); }
+  }
+  return out;
+}
+
+function linkNoteFromText(text, urls) {
+  let note = String(text || "");
+  for (const u of urls || []) {
+    // 同时去规范化前后的原串: URL() 可能补尾斜线。
+    note = note.split(u).join(" ");
+    const noSlash = u.endsWith("/") ? u.slice(0, -1) : u;
+    if (noSlash) note = note.split(noSlash).join(" ");
+  }
+  note = note.replace(WEB_URL_RE, " ").replace(/^[\s，。！？；：、:：-]+|[\s，。！？；：、:：-]+$/g, "");
+  return note.replace(/\s+/g, " ").trim();
+}
+
+function isPrivateIpv4(host) {
+  const p = String(host || "").split(".");
+  if (p.length !== 4 || p.some((x) => !/^\d+$/.test(x) || Number(x) > 255)) return false;
+  const a = p.map(Number);
+  return a[0] === 0 || a[0] === 10 || a[0] === 127 ||
+    (a[0] === 100 && a[1] >= 64 && a[1] <= 127) ||
+    (a[0] === 169 && a[1] === 254) ||
+    (a[0] === 172 && a[1] >= 16 && a[1] <= 31) ||
+    (a[0] === 192 && (a[1] === 0 || a[1] === 168)) ||
+    (a[0] === 198 && (a[1] === 18 || a[1] === 19)) || a[0] >= 224;
+}
+
+function isUnsafeWebUrl(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized) return true;
+  const u = new URL(normalized);
+  const h = u.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!h || h === "localhost" || h.endsWith(".localhost") || h.endsWith(".local") || h.endsWith(".internal") ||
+      h.endsWith(".lan") || h.endsWith(".home.arpa")) return true;
+  if (isPrivateIpv4(h)) return true;
+  // IPv4-mapped IPv6、loopback、link-local、ULA。
+  if (h === "::" || h === "::1" || h.startsWith("::ffff:") || h.startsWith("fe8") || h.startsWith("fe9") ||
+      h.startsWith("fea") || h.startsWith("feb") || h.startsWith("fc") || h.startsWith("fd")) return true;
+  // 单标签主机名通常是局域网服务。公网域名、IPv6 和 .onion 都有点或冒号。
+  if (!h.includes(".") && !h.includes(":")) return true;
+  return false;
+}
+
+function decodeHtmlEntities(text) {
+  const named = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "–", mdash: "—", hellip: "…", copy: "©", reg: "®" };
+  return String(text || "").replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]+);/gi, (all, key) => {
+    if (key[0] === "#") {
+      const hex = key[1].toLowerCase() === "x";
+      const n = parseInt(key.slice(hex ? 2 : 1), hex ? 16 : 10);
+      try { return Number.isFinite(n) ? String.fromCodePoint(n) : all; } catch (e) { return all; }
+    }
+    return Object.prototype.hasOwnProperty.call(named, key.toLowerCase()) ? named[key.toLowerCase()] : all;
+  });
+}
+
+function htmlAttr(tag, name) {
+  const re = new RegExp("(?:^|\\s)" + name.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&") + "\\s*=\\s*(?:\\\"([^\\\"]*)\\\"|'([^']*)'|([^\\s>]+))", "i");
+  const m = re.exec(tag || "");
+  return m ? decodeHtmlEntities(m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3])) : "";
+}
+
+function metaFromHtml(html, keys) {
+  for (const tag of String(html || "").match(/<meta\b[^>]*>/gi) || []) {
+    const id = (htmlAttr(tag, "property") || htmlAttr(tag, "name") || htmlAttr(tag, "itemprop")).toLowerCase();
+    if (keys.includes(id)) return htmlAttr(tag, "content").trim();
+  }
+  return "";
+}
+
+function absoluteHttpUrl(raw, baseUrl) {
+  try {
+    const u = new URL(raw, baseUrl);
+    return (u.protocol === "http:" || u.protocol === "https:") ? u.toString() : "";
+  } catch (e) { return ""; }
+}
+
+function cleanMarkdown(md) {
+  const codeBlocks = [];
+  let source = String(md || "").replace(/\u00a0/g, " ");
+  // 先保护插件生成的 fenced code，普通空白清理不能碰代码缩进和空行。
+  source = source.replace(/(^|\n)(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n\2(?=\n|$)/g, (block) => {
+    const token = "\u0000WEBCLIP_CODE_" + codeBlocks.length + "\u0000";
+    codeBlocks.push(block.replace(/^\n|\n$/g, ""));
+    return "\n" + token + "\n";
+  });
+  source = source.split("\n").map((line) => {
+    const trimmedEnd = line.replace(/[ \t]+$/g, "");
+    // 列表的行首空白是层级，不得抹掉；其它 HTML 排版空白不应变成代码块。
+    if (/^[ \t]+(?:[-+*]|\d+[.)])\s/.test(trimmedEnd)) return trimmedEnd;
+    return trimmedEnd.replace(/^[ \t]+/g, "").replace(/[ \t]{2,}/g, " ");
+  }).join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return source.replace(/\u0000WEBCLIP_CODE_(\d+)\u0000/g, (_, i) => codeBlocks[Number(i)] || "").trim();
+}
+
+function escapeWebText(value) {
+  return String(value || "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t\f\v]+/g, " ")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/!\[/g, "!\\[")
+    .replace(/\[\[/g, "\\[\\[")
+    .replace(/\]\]/g, "\\]\\]")
+    .replace(/%%/g, "\\%\\%")
+    .replace(/(^|\n)([ \t]*)(\d+)([.)])(?=\s)/g, "$1$2$3\\$4")
+    .replace(/(^|\n)([ \t]*)(`{3,}|~{3,}|#{1,6}(?=\s)|[-+*](?=\s)|>(?=\s))/g, "$1$2\\$3");
+}
+
+// 文本节点分别转义后仍可能在 DOM 边界拼出 ![ 或 [[。这里对最终正文再收口一次；
+// 插件自己的图片仍是 %%WECHAT_DIARY_IMAGE_n%% 占位，不会被误伤。
+function hardenWebMarkdown(value) {
+  return String(value || "")
+    .replace(/(^|[^\\])!\[/g, "$1!\\[")
+    .replace(/(^|[^\\])\[\[/g, "$1\\[\\[");
+}
+
+function fencedWebCode(value) {
+  const code = String(value || "").replace(/\r\n?/g, "\n").replace(/^\n+|\n+$/g, "");
+  if (!code) return "";
+  let longest = 0;
+  for (const m of code.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return "\n\n" + fence + "\n" + code + "\n" + fence + "\n\n";
+}
+
+function tableToMarkdown(table) {
+  const rows = [...table.querySelectorAll("tr")].map((tr) => [...tr.querySelectorAll(":scope > th, :scope > td")]
+    .map((c) => escapeWebText(c.textContent || "").replace(/\n+/g, " ").trim().replace(/\|/g, "\\|"))).filter((r) => r.length);
+  if (!rows.length) return "";
+  const width = Math.max(...rows.map((r) => r.length));
+  for (const r of rows) while (r.length < width) r.push("");
+  const out = ["| " + rows[0].join(" | ") + " |", "| " + rows[0].map(() => "---").join(" | ") + " |"];
+  for (const r of rows.slice(1)) out.push("| " + r.join(" | ") + " |");
+  return "\n\n" + out.join("\n") + "\n\n";
+}
+
+function webClipImageToken(index) { return "%%WECHAT_DIARY_IMAGE_" + index + "%%"; }
+
+function srcFromSrcset(srcset) {
+  const parts = String(srcset || "").split(",").map((x) => x.trim()).filter(Boolean);
+  if (!parts.length) return "";
+  return parts[parts.length - 1].split(/\s+/)[0] || "";
+}
+
+function collectWebClipImage(images, rawUrl, alt, baseUrl) {
+  const raw = String(rawUrl || "").trim();
+  if (!raw || raw === "null" || raw === "undefined" || raw === "#" || raw === "about:blank") return "";
+  const url = absoluteHttpUrl(raw, baseUrl);
+  if (!url) return "";
+  let i = images.findIndex((x) => x.url === url);
+  if (i < 0) {
+    i = images.length;
+    images.push({ url, alt: escapeWebText(alt || "").replace(/\n+/g, " ").replace(/[\[\]]/g, ""), token: webClipImageToken(i) });
+  } else if (!images[i].alt && alt) {
+    images[i].alt = escapeWebText(alt).replace(/\n+/g, " ").replace(/[\[\]]/g, "");
+  }
+  return images[i].token;
+}
+
+function imageTokenFromDom(node, baseUrl, images) {
+  const width = Number(node.getAttribute("width") || 0);
+  const height = Number(node.getAttribute("height") || 0);
+  if ((width > 0 && width <= 2) || (height > 0 && height <= 2)) return "";
+  const raw = node.getAttribute("data-src") || node.getAttribute("data-original") ||
+    node.getAttribute("data-lazy-src") || node.getAttribute("data-url") ||
+    srcFromSrcset(node.getAttribute("data-srcset") || node.getAttribute("srcset")) || node.getAttribute("src");
+  return collectWebClipImage(images, raw, node.getAttribute("alt") || node.getAttribute("title") || "", baseUrl);
+}
+
+function imageTokenFromTag(tag, baseUrl, images) {
+  const width = Number(htmlAttr(tag, "width") || 0);
+  const height = Number(htmlAttr(tag, "height") || 0);
+  if ((width > 0 && width <= 2) || (height > 0 && height <= 2)) return "";
+  const raw = htmlAttr(tag, "data-src") || htmlAttr(tag, "data-original") ||
+    htmlAttr(tag, "data-lazy-src") || htmlAttr(tag, "data-url") ||
+    srcFromSrcset(htmlAttr(tag, "data-srcset") || htmlAttr(tag, "srcset")) || htmlAttr(tag, "src");
+  return collectWebClipImage(images, raw, htmlAttr(tag, "alt") || htmlAttr(tag, "title"), baseUrl);
+}
+
+function domNodeToMarkdown(node, baseUrl, images) {
+  if (!node) return "";
+  if (node.nodeType === 3) return escapeWebText(node.nodeValue || "");
+  if (node.nodeType !== 1) return "";
+  const tag = String(node.tagName || "").toLowerCase();
+  if (["script", "style", "noscript", "template", "svg", "canvas", "form", "button", "iframe"].includes(tag)) return "";
+  if (tag === "br") return "\n";
+  if (tag === "hr") return "\n\n---\n\n";
+  if (tag === "pre") {
+    return fencedWebCode(node.textContent || "");
+  }
+  if (tag === "table") return tableToMarkdown(node);
+  if (tag === "img") {
+    const token = imageTokenFromDom(node, baseUrl, images || []);
+    return token ? "\n\n" + token + "\n\n" : "";
+  }
+  let inner = "";
+  for (const child of node.childNodes || []) inner += domNodeToMarkdown(child, baseUrl, images);
+  if (!inner.trim()) return "";
+  if (/^h[1-6]$/.test(tag)) return "\n\n" + "#".repeat(Number(tag[1])) + " " + cleanMarkdown(inner) + "\n\n";
+  if (tag === "p" || tag === "div" || tag === "section" || tag === "article" || tag === "main" || tag === "figure" || tag === "figcaption") {
+    return "\n\n" + inner.trim() + "\n\n";
+  }
+  if (tag === "blockquote") {
+    return "\n\n" + cleanMarkdown(inner).split("\n").map((l) => "> " + l).join("\n") + "\n\n";
+  }
+  if (tag === "strong" || tag === "b") return "**" + inner.trim() + "**";
+  if (tag === "em" || tag === "i") return "*" + inner.trim() + "*";
+  if (tag === "del" || tag === "s") return "~~" + inner.trim() + "~~";
+  if (tag === "code") return String.fromCharCode(96) + inner.trim().split(String.fromCharCode(96)).join("\\" + String.fromCharCode(96)) + String.fromCharCode(96);
+  if (tag === "a") {
+    const href = absoluteHttpUrl(node.getAttribute("href") || "", baseUrl);
+    const label = cleanMarkdown(inner).replace(/[\[\]]/g, "");
+    return href && label ? "[" + label + "](<" + href + ">)" : inner;
+  }
+  if (tag === "li") return "\n- " + cleanMarkdown(inner).replace(/\n/g, "\n  ");
+  if (tag === "ol") {
+    let i = 0;
+    const items = [...node.children].filter((c) => String(c.tagName).toLowerCase() === "li").map((li) => {
+      i += 1;
+      let body = ""; for (const c of li.childNodes) body += domNodeToMarkdown(c, baseUrl, images);
+      return i + ". " + cleanMarkdown(body).replace(/\n/g, "\n   ");
+    });
+    return "\n\n" + items.join("\n") + "\n\n";
+  }
+  if (tag === "ul") return "\n\n" + cleanMarkdown(inner) + "\n\n";
+  return inner;
+}
+
+const WEB_CLIP_REMOVE_SELECTOR = [
+  "script", "style", "noscript", "template", "svg", "canvas", "form", "button", "iframe",
+  "nav", "footer", "aside", "[aria-hidden='true']", ".advertisement", ".ads", ".ad", ".share",
+  ".social-share", ".related-posts", ".recommend-list", "#js_pc_qr_code", ".rich_media_tool",
+  "#js_article_bottom_bar", ".weui-dialog", ".rich_media_area_extra", ".rich_media_meta_list",
+  ".wx_follow_nickname", "#js_tags", "#js_minipro_dialog"
+].join(",");
+
+function textLen(node) {
+  if (!node) return 0;
+  const clone = node.cloneNode ? node.cloneNode(true) : null;
+  if (clone && typeof clone.querySelectorAll === "function") {
+    for (const el of clone.querySelectorAll("script,style,noscript,template")) el.remove();
+    return cleanMarkdown(clone.textContent || "").length;
+  }
+  return cleanMarkdown(node.textContent || "").length;
+}
+
+function chooseArticleRoot(doc) {
+  const selectors = [
+    "#js_content", "article", "main", "[role='main']", "[itemprop='articleBody']",
+    ".rich_media_content", ".article-content", ".article__content", ".post-content", ".entry-content",
+    ".content-article", ".article-body", ".post-body", ".markdown-body",
+  ];
+  const candidates = [], seen = new Set();
+  for (const sel of selectors) {
+    for (const el of doc.querySelectorAll(sel)) {
+      if (seen.has(el)) continue;
+      seen.add(el);
+      candidates.push(el);
+      // 明确正文容器一旦有足够正文就直接采用；公众号 #js_content 优先级最高。
+      if (textLen(el) >= WEB_CLIP_MIN_TEXT_CHARS) return el;
+    }
+  }
+  if (doc.body) candidates.push(doc.body);
+  let best = doc.body || doc.documentElement;
+  let bestScore = -Infinity;
+  for (const el of candidates) {
+    const len = textLen(el);
+    if (!len) continue;
+    let linkLen = 0;
+    for (const a of el.querySelectorAll("a")) linkLen += textLen(a);
+    const score = len - linkLen * 1.7 - (el === doc.body ? 150 : 0);
+    if (score > bestScore) { best = el; bestScore = score; }
+  }
+  return best;
+}
+
+function fallbackHtmlToMarkdown(html, baseUrl, images) {
+  let body = String(html || "");
+  const regions = [];
+  for (const tag of ["article", "main"]) {
+    const re = new RegExp("<" + tag + "\\b[^>]*>([\\s\\S]*?)<\\/" + tag + ">", "ig");
+    for (const m of body.matchAll(re)) regions.push(m[1]);
+  }
+  if (regions.length) body = regions.sort((a, b) => b.length - a.length)[0];
+  const codeBlocks = [];
+  body = body
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<(script|style|noscript|template|svg|canvas|form|nav|footer|aside|iframe)\b[\s\S]*?<\/\1>/gi, "")
+    .replace(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi, (_, code) => {
+      const token = "WEBCLIPPRETOKEN" + codeBlocks.length + "ENDTOKEN";
+      codeBlocks.push(fencedWebCode(decodeHtmlEntities(String(code).replace(/<[^>]+>/g, ""))));
+      return token;
+    });
+  // 只转义标签外的网页文本；插件随后生成的链接、标题、列表和图片占位不受影响。
+  body = body.split(/(<[^>]+>)/g).map((part) => part.startsWith("<")
+    ? part
+    : escapeWebText(decodeHtmlEntities(part))).join("");
+  body = body
+    .replace(/<img\b[^>]*>/gi, (tag) => {
+      const token = imageTokenFromTag(tag, baseUrl, images || []);
+      return token ? "\n\n" + token + "\n\n" : "";
+    })
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<hr\s*\/?>/gi, "\n\n---\n\n")
+    .replace(/<h([1-6])\b[^>]*>([\s\S]*?)<\/h\1>/gi, (_, n, x) => "\n\n" + "#".repeat(Number(n)) + " " + x + "\n\n")
+    .replace(/<li\b[^>]*>([\s\S]*?)<\/li>/gi, "\n- $1")
+    .replace(/<(p|div|section|blockquote|ul|ol|table|tr|figure|figcaption)\b[^>]*>/gi, "\n\n")
+    .replace(/<\/(p|div|section|blockquote|ul|ol|table|tr|figure|figcaption)>/gi, "\n\n")
+    .replace(/<strong\b[^>]*>([\s\S]*?)<\/strong>/gi, "**$1**")
+    .replace(/<b\b[^>]*>([\s\S]*?)<\/b>/gi, "**$1**")
+    .replace(/<em\b[^>]*>([\s\S]*?)<\/em>/gi, "*$1*")
+    .replace(/<i\b[^>]*>([\s\S]*?)<\/i>/gi, "*$1*")
+    .replace(/<a\b([^>]*)>([\s\S]*?)<\/a>/gi, (_, attrs, label) => {
+      const href = absoluteHttpUrl(htmlAttr(attrs, "href"), baseUrl);
+      const clean = label.replace(/<[^>]+>/g, "").trim();
+      // 这里之后还要剥 HTML 标签, 不能使用 <url> 目的地(会被当标签删掉)。
+      return href && clean ? "[" + clean + "](" + href + ")" : clean;
+    })
+    .replace(/<[^>]+>/g, "");
+  let markdown = cleanMarkdown(body);
+  markdown = markdown.replace(/WEBCLIPPRETOKEN(\d+)ENDTOKEN/g, (_, i) => codeBlocks[Number(i)] || "");
+  return hardenWebMarkdown(cleanMarkdown(markdown));
+}
+
+function wechatPageVar(html, name) {
+  // 只接受真实的 var NAME = 声明，避免咬到 "__biz=" + biz + "&mid=" 之类的拼接诱饵。
+  // 公众号长链常见 var biz = "" || "Mz..."，因此允许一个空字面量加 || 的前缀。
+  const re = new RegExp("(?:^|[;{}>\\s])var\\s+" + escapeRegExp(name) +
+    "\\s*=\\s*(?:[\\\"']\\s*[\\\"']\\s*\\|\\|\\s*)?[\\\"']([^\\\"']+)[\\\"']", "im");
+  const m = re.exec(String(html || ""));
+  const value = m ? decodeHtmlEntities(m[1]).trim() : "";
+  if (!value) return "";
+  if (name === "biz" && !/^[A-Za-z0-9+/_-]{4,128}={0,2}$/.test(value)) return "";
+  if (name === "mid" && !/^\d{5,30}$/.test(value)) return "";
+  if (name === "idx" && !/^\d{1,3}$/.test(value)) return "";
+  return value;
+}
+
+function wechatPublishedFromHtml(html) {
+  const raw = wechatPageVar(html, "createTime");
+  if (!raw) return "";
+  if (/^\d{10,13}$/.test(raw)) {
+    const n = Number(raw) * (raw.length === 10 ? 1000 : 1);
+    const d = new Date(n);
+    if (Number.isFinite(d.getTime())) return d.toISOString();
+  }
+  return raw.replace(/\s+/g, " ").slice(0, 80);
+}
+
+function stripWechatTrackingParams(raw) {
+  const normalized = normalizeWebUrl(raw);
+  if (!normalized || !isWechatArticleUrl(normalized)) return normalized || raw;
+  const u = new URL(normalized);
+  if (/^\/s\/[^/]+/.test(u.pathname)) {
+    u.search = "";
+    return u.toString();
+  }
+  for (const key of ["chksm", "scene", "nwr_flag", "subscene", "clicktime", "enterid", "ascene", "devicetype", "version", "lang", "nettype", "exportkey", "pass_ticket", "wx_header", "from"]) {
+    u.searchParams.delete(key);
+  }
+  return u.toString();
+}
+
+function wechatArticleIdentityUrl(html, sourceUrl, canonicalUrl) {
+  if (!isWechatArticleUrl(sourceUrl) && !isWechatArticleUrl(canonicalUrl)) return normalizeWebUrl(canonicalUrl || sourceUrl) || String(canonicalUrl || sourceUrl || "");
+  const parsed = [];
+  for (const raw of [sourceUrl, canonicalUrl]) {
+    try { parsed.push(new URL(normalizeWebUrl(raw) || "")); }
+    catch (e) { /* 单个候选无效时继续 */ }
+  }
+  const validBiz = (v) => /^[A-Za-z0-9+/_-]{4,128}={0,2}$/.test(String(v || "")) ? String(v) : "";
+  const validMid = (v) => /^\d{5,30}$/.test(String(v || "")) ? String(v) : "";
+  const validIdx = (v) => /^\d{1,3}$/.test(String(v || "")) ? String(v) : "";
+  const firstParam = (names, validate) => {
+    for (const u of parsed) {
+      for (const name of names) {
+        const value = validate(u.searchParams.get(name));
+        if (value) return value;
+      }
+    }
+    return "";
+  };
+  // 明确 URL 参数优先于页面变量；页面脚本里可能含字符串拼接诱饵。
+  const biz = firstParam(["__biz", "biz"], validBiz) || wechatPageVar(html, "biz");
+  const mid = firstParam(["mid"], validMid) || wechatPageVar(html, "mid");
+  const idx = firstParam(["idx"], validIdx) || wechatPageVar(html, "idx");
+  if (biz && mid && idx) {
+    const u = new URL("https://mp.weixin.qq.com/s");
+    u.searchParams.set("__biz", biz);
+    u.searchParams.set("mid", mid);
+    u.searchParams.set("idx", idx);
+    return u.toString();
+  }
+  // 只有拿不到规范的 biz/mid/idx 时，才退回 /s/<id> 身份。
+  for (const u of parsed) {
+    const short = /^\/s\/([^/?#]+)/.exec(u.pathname);
+    if (short) return "https://mp.weixin.qq.com/s/" + short[1];
+  }
+  return stripWechatTrackingParams(canonicalUrl || sourceUrl);
+}
+
+function extractArticleFromHtml(html, sourceUrl, maxChars) {
+  html = String(html || "");
+  const images = [];
+  let title = "", author = "", published = "", site = "", description = "", canonical = sourceUrl, markdown = "";
+  if (typeof DOMParser !== "undefined") {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const meta = (...sels) => {
+      for (const sel of sels) { const el = doc.querySelector(sel); if (el && el.getAttribute("content")) return el.getAttribute("content").trim(); }
+      return "";
+    };
+    title = meta('meta[property="og:title"]', 'meta[name="twitter:title"]') || cleanMarkdown((doc.querySelector("h1") || {}).textContent || "") || cleanMarkdown(doc.title || "");
+    author = meta('meta[name="author"]', 'meta[property="article:author"]', 'meta[name="byl"]');
+    published = meta('meta[property="article:published_time"]', 'meta[name="publishdate"]', 'meta[itemprop="datePublished"]', 'meta[name="date"]') || wechatPublishedFromHtml(html);
+    site = meta('meta[property="og:site_name"]', 'meta[name="application-name"]');
+    description = meta('meta[property="og:description"]', 'meta[name="description"]', 'meta[name="twitter:description"]');
+    const canonicalEl = doc.querySelector('link[rel="canonical"]') || doc.querySelector('meta[property="og:url"]');
+    const canonicalRaw = canonicalEl && (canonicalEl.getAttribute("href") || canonicalEl.getAttribute("content"));
+    canonical = absoluteHttpUrl(canonicalRaw || "", sourceUrl) || sourceUrl;
+    const root = chooseArticleRoot(doc);
+    const clone = root && root.cloneNode(true);
+    if (clone) {
+      for (const el of clone.querySelectorAll(WEB_CLIP_REMOVE_SELECTOR)) el.remove();
+      markdown = cleanMarkdown(domNodeToMarkdown(clone, canonical || sourceUrl, images));
+    }
+  } else {
+    title = metaFromHtml(html, ["og:title", "twitter:title"]);
+    if (!title) {
+      const h1 = /<h1\b[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+      const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+      title = decodeHtmlEntities(((h1 && h1[1]) || (tm && tm[1]) || "").replace(/<[^>]+>/g, "")).trim();
+    }
+    author = metaFromHtml(html, ["author", "article:author", "byl"]);
+    published = metaFromHtml(html, ["article:published_time", "publishdate", "datepublished", "date"]) || wechatPublishedFromHtml(html);
+    site = metaFromHtml(html, ["og:site_name", "application-name"]);
+    description = metaFromHtml(html, ["og:description", "description", "twitter:description"]);
+    const can = /<link\b[^>]*rel=["']canonical["'][^>]*>/i.exec(html) || /<link\b[^>]*href=["'][^"']+["'][^>]*rel=["']canonical["'][^>]*>/i.exec(html);
+    canonical = absoluteHttpUrl(can ? htmlAttr(can[0], "href") : "", sourceUrl) || sourceUrl;
+    markdown = fallbackHtmlToMarkdown(html, canonical || sourceUrl, images);
+  }
+  title = cleanMarkdown(title).replace(/\s+/g, " ").slice(0, 240);
+  if (!title) {
+    try { title = new URL(sourceUrl).hostname; } catch (e) { title = "网页剪藏"; }
+  }
+  // 正文里常把文章标题再放一个 H1, 文件自己的 H1 已经会写一次, 去重但不碰不同的小标题。
+  const first = markdown.split("\n")[0] || "";
+  if (/^#\s+/.test(first) && cleanMarkdown(first.replace(/^#+\s*/, "")) === title) markdown = markdown.split("\n").slice(1).join("\n").trim();
+  const limit = Number.isFinite(Number(maxChars)) ? Math.max(1000, Number(maxChars)) : 200000;
+  const truncated = markdown.length > limit;
+  if (truncated) markdown = markdown.slice(0, limit).replace(/\s+\S*$/, "").trim();
+  markdown = hardenWebMarkdown(markdown);
+  canonical = stripWechatTrackingParams(canonical || sourceUrl);
+  const identityUrl = wechatArticleIdentityUrl(html, sourceUrl, canonical || sourceUrl);
+  return { title, author: cleanMarkdown(author), published: cleanMarkdown(published), site: cleanMarkdown(site),
+    description: cleanMarkdown(description), url: sourceUrl, canonicalUrl: canonical || sourceUrl, identityUrl, markdown, truncated, images };
+}
+
+function safeClipFilename(title) {
+  let s = cleanMarkdown(title || "网页剪藏").replace(/[\u0000-\u001f:*?"<>|#^/\\[\]]/g, "").replace(/\.+$/g, "").trim();
+  if (!s) s = "网页剪藏";
+  if ([...s].length > 60) s = [...s].slice(0, 60).join("");
+  while (Buffer.byteLength(s, "utf8") > 180 && [...s].length > 1) s = [...s].slice(0, -1).join("");
+  return s;
+}
+
+function webClipIdentityUrl(article) {
+  return normalizeWebUrl(article && (article.identityUrl || article.canonicalUrl || article.url)) ||
+    String(article && (article.identityUrl || article.canonicalUrl || article.url) || "");
+}
+
+function yamlString(value) { return JSON.stringify(String(value || "")); }
+
+function formatWebClipMarkdown(article, note, clippedAt) {
+  const title = article.title || "网页剪藏";
+  const displayTitle = escapeWebText(title).replace(/\n+/g, " ").trim() || "网页剪藏";
+  const sourceUrl = article.url || article.canonicalUrl || "";
+  const imageCount = Math.max(0, Number(article.imageCount) || 0);
+  const imageFailed = Math.max(0, Number(article.imageFailed) || 0);
+  const imageTotal = Math.max(imageCount + imageFailed, Number(article.imageTotal) || 0);
+  const lines = [
+    "---",
+    "title: " + yamlString(title),
+    "source_url: " + yamlString(sourceUrl),
+    "canonical_url: " + yamlString(article.canonicalUrl || sourceUrl),
+    "identity_url: " + yamlString(article.identityUrl || article.canonicalUrl || sourceUrl),
+    "source_site: " + yamlString(article.site || ""),
+    "author: " + yamlString(article.author || ""),
+    "published: " + yamlString(article.published || ""),
+    "clipped_at: " + yamlString(clippedAt || new Date().toISOString()),
+    "source: wechat-diary-web-clip",
+    "web_clip_image_total: " + imageTotal,
+    "web_clip_image_count: " + imageCount,
+    "web_clip_image_failed: " + imageFailed,
+    "tags:",
+    "  - 微信剪藏",
+    "---",
+    "",
+    "# " + displayTitle,
+    "",
+    "> [查看原文](<" + sourceUrl + ">)",
+  ];
+  if (article.author) lines.push("> 作者：" + escapeWebText(article.author).replace(/\n+/g, " "));
+  if (article.published) lines.push("> 发布：" + escapeWebText(article.published).replace(/\n+/g, " "));
+  if (article.site) lines.push("> 来源：" + escapeWebText(article.site).replace(/\n+/g, " "));
+  if (note) lines.push("", "## 微信附言", "", String(note).replace(/\r\n?/g, "\n").trim());
+  lines.push("", "## 正文", "", article.markdown || "_正文为空_", "");
+  if (imageFailed) {
+    lines.push("## 图片保存报告", "", "> [!warning] 有 " + imageFailed + " 张图片未能保存；正文中保留了可点击的原图地址。", "");
+    const failures = Array.isArray(article.imageFailures) ? article.imageFailures : [];
+    for (const failure of failures.slice(0, 20)) {
+      const reason = String((failure && failure.error) || "图片下载失败").replace(/[\r\n]+/g, " ").trim();
+      const failureUrl = normalizeWebUrl(failure && failure.url);
+      lines.push("- " + reason + (failureUrl ? " — [查看原图](<" + failureUrl + ">)" : ""));
+    }
+    if (failures.length > 20) lines.push("- 另有 " + (failures.length - 20) + " 项未展开");
+    lines.push("");
+  }
+  if (article.truncated) lines.push("> [!warning] 正文过长，已按插件上限截断；原文链接保留在上方。", "");
+  return lines.join("\n");
+}
+
+function responseHeader(headers, name) {
+  for (const k of Object.keys(headers || {})) if (k.toLowerCase() === name.toLowerCase()) return String(headers[k] || "");
+  return "";
+}
+
+function requestWebClipBinaryHop(url, headers, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let req = null;
+    let timer = null;
+    const chunks = [];
+    let total = 0;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) window.clearTimeout(timer);
+      fn(value);
+    };
+    try {
+      const parsed = new URL(url);
+      const transport = parsed.protocol === "https:" ? getHttps() : require("http");
+      req = transport.request(parsed, { method: "GET", headers }, (res) => {
+        const status = Number(res.statusCode || 0);
+        if (status >= 300 && status < 400 && res.headers.location) {
+          res.resume();
+          done(resolve, { redirect: new URL(res.headers.location, url).toString() });
+          return;
+        }
+        if (!(status >= 200 && status < 300)) {
+          res.resume();
+          done(reject, new Error("HTTP " + (status || "错误")));
+          return;
+        }
+        const announced = Number(res.headers["content-length"] || 0);
+        if (announced > WEB_CLIP_MAX_IMAGE_BYTES) {
+          res.resume();
+          done(reject, new Error("单张图片超过 15MB 上限"));
+          return;
+        }
+        res.on("data", (chunk) => {
+          if (settled) return;
+          total += chunk.length;
+          if (total > WEB_CLIP_MAX_IMAGE_BYTES) {
+            done(reject, new Error("单张图片超过 15MB 上限"));
+            try { req.destroy(); } catch (e) { /* noop */ }
+            return;
+          }
+          chunks.push(chunk);
+        });
+        res.on("aborted", () => done(reject, new Error("图片下载中断")));
+        res.on("end", () => done(resolve, { status, headers: res.headers, buffer: Buffer.concat(chunks) }));
+      });
+      timer = window.setTimeout(() => {
+        done(reject, new Error("图片响应超时"));
+        try { req.destroy(); } catch (e) { /* noop */ }
+      }, Math.max(1, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS));
+      req.on("error", (e) => done(reject, e));
+      req.end();
+    } catch (e) {
+      done(reject, e);
+    }
+  });
+}
+
+async function requestWebClipBinaryDirect(rawUrl, headers, timeoutMs) {
+  let url = normalizeWebUrl(rawUrl);
+  if (!url || isUnsafeWebUrl(url)) throw new Error("图片地址不是公开 http/https URL");
+  const deadline = Date.now() + Math.max(1, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS);
+  for (let hop = 0; hop <= MEDIA_MAX_REDIRECTS; hop++) {
+    let result = null;
+    let lastError = null;
+    // 某些图片 CDN（实测 pbs.twimg.com）偶发在 TLS 建连前 ECONNRESET；短暂重试一次即可恢复。
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("图片响应超时");
+        result = await requestWebClipBinaryHop(url, headers, remaining);
+        break;
+      } catch (e) {
+        lastError = e;
+        const message = String((e && e.message) || e);
+        const reset = e && e.code === "ECONNRESET" || /ECONNRESET/i.test(message);
+        if (attempt > 0 || !reset) throw e;
+        const delay = Math.min(200, Math.max(0, deadline - Date.now()));
+        if (!delay) throw new Error("图片响应超时");
+        await new Promise((resolve) => window.setTimeout(resolve, delay));
+      }
+    }
+    if (!result) throw lastError || new Error("图片直连失败");
+    if (!result.redirect) return result;
+    if (hop >= MEDIA_MAX_REDIRECTS) throw new Error("图片重定向过多");
+    url = normalizeWebUrl(result.redirect);
+    if (!url || isUnsafeWebUrl(url)) throw new Error("图片重定向到了非公开地址");
+  }
+  throw new Error("图片重定向过多");
+}
+
+class WebClipError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+function isBlockedByClientError(error) {
+  return /ERR_BLOCKED_BY_CLIENT/i.test(String((error && error.message) || error || ""));
+}
+
+class WebClipper {
+  constructor(plugin, deps) {
+    this.plugin = plugin;
+    this._directImageRequest = deps && deps.directImageRequest ? deps.directImageRequest : requestWebClipBinaryDirect;
+    this._resolveWechatShortJump = deps && deps.resolveWechatShortJump ? deps.resolveWechatShortJump : resolveWechatShortJump;
+  }
+
+  async _fetchImage(image, referer, timeoutMs) {
+    const url = normalizeWebUrl(image && image.url);
+    if (!url || isUnsafeWebUrl(url)) throw new WebClipError("unsafe_image", "图片地址不是公开 http/https URL");
+    const budget = Math.max(1, Math.min(WEB_CLIP_IMAGE_TIMEOUT_MS, Number(timeoutMs) || WEB_CLIP_IMAGE_TIMEOUT_MS));
+    const deadline = Date.now() + budget;
+    const imageHeaders = {
+      Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif,*/*;q=0.5",
+      Referer: referer,
+      "User-Agent": WEB_CLIP_BROWSER_UA,
+    };
+    let response;
+    let requestError = null;
+    // 优先走 Obsidian 请求层，遵循系统代理。只有 Electron 明确以
+    // ERR_BLOCKED_BY_CLIENT 拒绝跨域图片时，才退回桌面端 Node 直连。
+    try {
+      let timeoutId;
+      try {
+        response = await Promise.race([
+          requestUrl({
+            url, method: "GET", throw: false,
+            headers: { Accept: imageHeaders.Accept, "User-Agent": imageHeaders["User-Agent"] },
+          }),
+          new Promise((_, reject) => {
+            timeoutId = window.setTimeout(() => reject(new Error("图片响应超时")), budget);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+      }
+    } catch (e) {
+      requestError = e;
+    }
+    if (!response) {
+      if (!isBlockedByClientError(requestError)) {
+        throw new WebClipError("image_network", "图片无法访问: " + String((requestError && requestError.message) || requestError || "未知错误"));
+      }
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error("图片响应超时");
+        response = await this._directImageRequest(url, imageHeaders, remaining);
+      } catch (e) {
+        throw new WebClipError("image_network", "图片无法访问: " + String((e && e.message) || e));
+      }
+    }
+    const status = Number(response && response.status);
+    if (!(status >= 200 && status < 300)) throw new WebClipError("image_http", "图片返回 HTTP " + (status || "错误"));
+    const announced = Number(responseHeader(response.headers, "content-length"));
+    if (Number.isFinite(announced) && announced > WEB_CLIP_MAX_IMAGE_BYTES) {
+      throw new WebClipError("image_too_large", "单张图片超过 15MB 上限");
+    }
+    let buf = Buffer.alloc(0);
+    if (response.buffer) buf = Buffer.isBuffer(response.buffer) ? response.buffer : Buffer.from(response.buffer);
+    else if (response.arrayBuffer) buf = Buffer.from(response.arrayBuffer);
+    if (!buf.length) throw new WebClipError("image_empty", "图片没有返回内容");
+    if (buf.length > WEB_CLIP_MAX_IMAGE_BYTES) throw new WebClipError("image_too_large", "单张图片超过 15MB 上限");
+    const ext = sniffImageExt(buf);
+    if (!ext) throw new WebClipError("image_format", "图片格式无法识别");
+    return { ...image, url, buffer: buf, ext };
+  }
+
+  async fetchArticle(rawUrl) {
+    const deadline = Date.now() + WEB_CLIP_TOTAL_BUDGET_MS;
+    let url = normalizeWebUrl(rawUrl);
+    if (!url || isUnsafeWebUrl(url)) throw new WebClipError("unsafe", "只支持公开的 http/https 网页");
+    if (isWechatShortJumpUrl(url)) {
+      let jump;
+      try { jump = await this._resolveWechatShortJump(url, Math.min(10000, WEB_CLIP_FETCH_TIMEOUT_MS)); }
+      catch (e) { throw new WebClipError("wechat_jump", "微信短链接无法解析: " + String((e && e.message) || e)); }
+      if (jump && jump.kind === "ask") {
+        throw new WebClipError("wechat_ask", "这是微信“问一问”链接，正文依赖微信登录态和页面脚本，当前只能保存原链接");
+      }
+      if (jump && jump.kind === "wechat_internal") {
+        throw new WebClipError("wechat_internal", "这是微信内部页面，不是可直接剪藏的公众号文章");
+      }
+      if (jump && jump.kind === "external") {
+        throw new WebClipError("wechat_external", "微信短链接跳转到了非公众号网站；如需抓取，请开启“其他网站的链接也提取正文”后发送最终网址");
+      }
+      if (jump && jump.url && !isUnsafeWebUrl(jump.url)) url = normalizeWebUrl(jump.url) || url;
+    }
+    let res;
+    try {
+      const call = requestUrl({
+        url, method: "GET", throw: false,
+        headers: {
+          Accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5",
+          "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+          "User-Agent": WEB_CLIP_BROWSER_UA,
+        },
+      });
+      let timeoutId;
+      try {
+        res = await Promise.race([
+          call,
+          new Promise((_, reject) => {
+            timeoutId = window.setTimeout(() => reject(new WebClipError("timeout", "网页响应超时")), WEB_CLIP_FETCH_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+      }
+    } catch (e) {
+      if (e instanceof WebClipError) throw e;
+      throw new WebClipError("network", "网页无法访问: " + String((e && e.message) || e));
+    }
+    const status = Number(res && res.status);
+    if (!(status >= 200 && status < 300)) throw new WebClipError("http", "网页返回 HTTP " + (status || "错误"));
+    const type = responseHeader(res.headers, "content-type").toLowerCase();
+    if (type && !type.includes("text/html") && !type.includes("application/xhtml+xml")) {
+      throw new WebClipError("content_type", "这不是 HTML 网页 (" + type.split(";")[0] + ")");
+    }
+    let html = typeof res.text === "string" ? res.text : "";
+    if (!html && res.arrayBuffer) html = Buffer.from(res.arrayBuffer).toString("utf8");
+    if (!html) throw new WebClipError("empty", "网页没有返回内容");
+    if (Buffer.byteLength(html, "utf8") > WEB_CLIP_MAX_HTML_BYTES) throw new WebClipError("too_large", "网页源码超过 5MB 上限");
+    const responseUrl = normalizeWebUrl(res && (res.url || res.finalUrl));
+    const effectiveUrl = responseUrl && !isUnsafeWebUrl(responseUrl) ? responseUrl : url;
+    const article = extractArticleFromHtml(html, effectiveUrl, this.plugin.settings.webClipMaxChars);
+    const bodyText = cleanMarkdown(article.markdown
+      .replace(/!\[[^\]]*\]\(<[^>]+>\)/g, "")
+      .replace(/%%WECHAT_DIARY_IMAGE_\d+%%/g, ""));
+    if (!article.markdown || bodyText.length < WEB_CLIP_MIN_TEXT_CHARS) {
+      throw new WebClipError("no_text", "没找到足够的正文，网页可能需要登录或 JavaScript 渲染");
+    }
+    const referencedImages = (article.images || []).filter((image) => article.markdown.includes(image.token));
+    if (this.plugin.settings.webClipSaveImages === false) {
+      article.images = referencedImages.map((image) => ({ ...image, skipped: true }));
+      return article;
+    }
+    const maxImages = webClipMaxImages(this.plugin.settings);
+    const maxTotalImageBytes = webClipMaxTotalImageBytes(this.plugin.settings);
+    const maxTotalImageMb = Math.floor(maxTotalImageBytes / 1024 / 1024);
+    const downloaded = new Array(referencedImages.length);
+    for (let i = maxImages; i < referencedImages.length; i++) {
+      downloaded[i] = { ...referencedImages[i], error: "超过每篇 " + maxImages + " 张图片上限" };
+    }
+    let nextImage = 0;
+    const worker = async () => {
+      while (true) {
+        const i = nextImage++;
+        if (i >= Math.min(maxImages, referencedImages.length)) return;
+        const image = referencedImages[i];
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          downloaded[i] = { ...image, error: "超过 75 秒总时间预算，未下载" };
+          continue;
+        }
+        try {
+          downloaded[i] = await this._fetchImage(image, article.canonicalUrl || url, Math.min(WEB_CLIP_IMAGE_TIMEOUT_MS, remaining));
+        } catch (e) {
+          const reason = String((e && e.message) || e);
+          console.warn("[wechat-diary] 网页正文图片下载失败:", image.url, reason);
+          downloaded[i] = { ...image, error: reason };
+        }
+      }
+    };
+    const workers = Math.min(WEB_CLIP_IMAGE_CONCURRENCY, maxImages, referencedImages.length);
+    await Promise.all(Array.from({ length: workers }, () => worker()));
+    let totalBytes = 0;
+    for (let i = 0; i < downloaded.length; i++) {
+      const saved = downloaded[i];
+      if (!saved || !saved.buffer) continue;
+      if (totalBytes + saved.buffer.length > maxTotalImageBytes) {
+        downloaded[i] = { ...referencedImages[i], error: "正文图片合计超过 " + maxTotalImageMb + "MB 上限" };
+      } else {
+        totalBytes += saved.buffer.length;
+      }
+    }
+    article.images = downloaded;
+    return article;
+  }
+}
+
 // ── 日记写入(019 diary_writer.py 移植, 产出字节级一致; 宿主换成 vault API)─
 
 const HEADER_RE_G = /\*\*(\d{1,2}:\d{2})\*\*/g;
 const HEADER_FULL_RE = /^\*\*\d{1,2}:\d{2}\*\*$/;
 const NORMALIZE_BLANK_RE = /\n\s*\n+/g;
+
+// 日记消息块统一入口：CRLF、空行与契约保留前缀必须和 write() 完全一致，
+// 否则一次发送会被拆成多个块，或让撤回误删更早的内容。
+function normalizeDiaryBlockText(value, protectPrefix) {
+  let text = String(value || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n")
+    .replace(NORMALIZE_BLANK_RE, "\n").trim();
+  if (protectPrefix !== false && (text.startsWith("# ") || text.startsWith("---") || text.startsWith("_("))) text = "\\" + text;
+  return text;
+}
 const CLOSING_MARKER = "_(今日封存于";
 
 function lastHeaderTime(content) {
@@ -3172,25 +4236,531 @@ function countMessages(content) {
   return content.split("\n\n").filter((b) => isMessageBlock(b.trim())).length;
 }
 
+// ── #15/D13 路径层与共用文件模式的纯函数(表驱动可测, bindtest 走 __internals) ─────────────
+// ===== #15 路径层 + 共用每日笔记节: 纯函数(逐段粘进 main.js) =====
+// 约定: 顶层 function 声明 + 少量 const 常量; 不 import/require; 末尾一行 module.exports 只给测试用。
+
+// ---------- 路径格式校验 ----------
+
+// moment 日期类令牌白名单: 字母 → 允许的连续段长(按 moment 贪心分词: 同一字母连续为一段)
+const PATH_TOKEN_LENGTHS = {
+  Y: [2, 4],        // YY YYYY
+  M: [1, 2, 3, 4],  // M MM MMM MMMM
+  D: [1, 2, 3, 4],  // D DD DDD DDDD
+  d: [1, 2, 3, 4],  // d dd ddd dddd
+  E: [1],
+  e: [1],
+  w: [1, 2],        // w ww
+  Q: [1],
+};
+const PATH_LITERAL_RE = /\[[^\[]*\]/g;        // moment 的 [..] 字面量(与 moment 源码同一条正则)
+const PATH_ILLEGAL_CHARS_RE = /[\\:*?"<>|]/;
+const PATH_TOKEN_ERROR = "英文字母会被当成日期代码, 文件夹名请放在方括号里, 如 [Assets]";
+const PATH_NOT_DAILY_ERROR = "这个格式两天会写进同一个文件";
+
+function renderPath(format, dateStr, momentLib) {
+  const m = momentLib(dateStr, "YYYY-MM-DD");
+  // 纯数字令牌固定 en 地区: moment 在 ar/fa/hi 等界面语言下会把数字换成本地数字, 独立模式的默认路径必须与 0.3.1 逐字节相同;
+  // 只有带月份/星期名(MMM/dddd)的格式才跟界面语言走(与每日笔记核心插件一致)
+  const bare = String(format).replace(PATH_LITERAL_RE, "");
+  if (/MMM|ddd/.test(bare) || typeof m.locale !== "function") return m.format(format);
+  return m.locale("en").format(format);
+}
+
+// 剥掉 [..] 字面量后, 剩余英文字母必须全部是白名单令牌
+function pathFormatTokensOk(format) {
+  const bare = format.replace(PATH_LITERAL_RE, "");
+  const runs = bare.match(/[A-Za-z]+/g) || [];
+  for (const run of runs) {
+    let i = 0;
+    while (i < run.length) {
+      const ch = run[i];
+      let j = i;
+      while (j < run.length && run[j] === ch) j++;
+      const allowed = PATH_TOKEN_LENGTHS[ch];
+      if (!allowed || allowed.indexOf(j - i) === -1) return false;
+      i = j;
+    }
+  }
+  return true;
+}
+
+// 渲染出来的一条路径的形状检查; 返回错误文案或 null
+function renderedPathError(rendered) {
+  if (PATH_ILLEGAL_CHARS_RE.test(rendered)) return '路径里不能有 \\ : * ? " < > | 这些字符';
+  const segs = rendered.split("/");
+  if (segs.some((s) => s === "")) return "路径里不能有空的文件夹名";
+  if (segs.some((s) => s === "..")) return "路径里不能有 ..";
+  return null;
+}
+
+// 2024-01-01 … 2024-12-31(闰年 366 天)+ 2025-01-01
+function dailyProbeDates() {
+  const out = [];
+  const start = Date.UTC(2024, 0, 1);
+  for (let i = 0; i < 367; i++) {
+    out.push(new Date(start + i * 86400000).toISOString().slice(0, 10));
+  }
+  return out;
+}
+
+// opts = { requireDaily: boolean, momentLib }
+// 返回 { ok, value, error }; value 为清洗后的格式串(不合法时也给, 供预览)
+function validatePathFormat(format, opts) {
+  const momentLib = opts && opts.momentLib;
+  const requireDaily = !!(opts && opts.requireDaily);
+  const fail = (value, error) => ({ ok: false, value, error });
+
+  let v = typeof format === "string" ? format : "";
+  const strip = (s) => s.replace(/^[\s/]+|[\s/]+$/g, "");
+  v = strip(v);
+  v = v.replace(/\.md$/i, "");
+  v = strip(v);
+
+  if (!v) return fail(v, "路径格式不能为空");
+  if (v.split("/").some((s) => s === "..")) return fail(v, "路径里不能有 ..");
+  if (!pathFormatTokensOk(v)) return fail(v, PATH_TOKEN_ERROR);
+
+  const probes = requireDaily ? dailyProbeDates() : ["2024-01-01"];
+  const seen = new Set();
+  for (const day of probes) {
+    let rendered;
+    try {
+      rendered = renderPath(v, day, momentLib);
+    } catch (e) {
+      return fail(v, "这个格式没法渲染: " + (e && e.message ? e.message : String(e)));
+    }
+    const err = renderedPathError(rendered);
+    if (err) return fail(v, err);
+    if (requireDaily) {
+      if (seen.has(rendered)) return fail(v, PATH_NOT_DAILY_ERROR);
+      seen.add(rendered);
+    }
+  }
+  return { ok: true, value: v, error: null };
+}
+
+// ---------- 节标题 ----------
+
+// 返回 { value, stripped, error }; stripped = 剥掉了前导 #
+function normalizeHeading(raw) {
+  let v = typeof raw === "string" ? raw.trim() : "";
+  let stripped = false;
+  if (v.charAt(0) === "#") {
+    v = v.replace(/^#+\s*/, "").trim();
+    stripped = true;
+  }
+  let error = null;
+  if (!v) error = "节标题不能为空";
+  else if (/[\r\n]/.test(v)) error = "节标题不能换行";
+  else if (Array.from(v).length > 30) error = "节标题最多 30 个字";
+  return { value: v, stripped, error };
+}
+
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// ---------- 节的定位与写回(§4.1) ----------
+
+const FENCE_LINE_RE = /^ {0,3}(```|~~~)/;
+const FM_DELIM_LINE_RE = /^---[ \t]*\r?$/;
+const ANY_HEADING_LINE_RE = /^#{1,6} /;
+
+// 文件以 --- 行开头且后面有闭合 --- 行 → 返回闭合行之后的偏移; 否则 0(从头扫)
+function frontmatterEnd(content) {
+  const len = content.length;
+  let e = content.indexOf("\n");
+  if (e === -1) e = len;
+  if (!FM_DELIM_LINE_RE.test(content.slice(0, e))) return 0;
+  let pos = e + 1;
+  while (pos < len) {
+    let le = content.indexOf("\n", pos);
+    if (le === -1) le = len;
+    if (FM_DELIM_LINE_RE.test(content.slice(pos, le))) return le < len ? le + 1 : len;
+    pos = le + 1;
+  }
+  return 0;
+}
+
+// 返回 { headingStart, bodyStart, bodyEnd } 或 null
+function locateSection(content, heading) {
+  if (typeof content !== "string") return null;
+  const len = content.length;
+  const target = "## " + heading;
+  let inFence = false;
+  let headingStart = -1;
+  let bodyStart = -1;
+  let pos = frontmatterEnd(content);
+  while (pos < len) {
+    let e = content.indexOf("\n", pos);
+    if (e === -1) e = len;
+    const line = content.slice(pos, e);
+    const next = e < len ? e + 1 : len;
+    if (FENCE_LINE_RE.test(line)) {
+      inFence = !inFence;
+    } else if (!inFence) {
+      if (headingStart === -1) {
+        if (line.replace(/[ \t\r]+$/, "") === target) {
+          headingStart = pos;
+          bodyStart = next;
+        }
+      } else if (ANY_HEADING_LINE_RE.test(line)) {
+        return { headingStart, bodyStart, bodyEnd: pos };
+      }
+    }
+    pos = next;
+  }
+  if (headingStart === -1) return null;
+  return { headingStart, bodyStart, bodyEnd: len };
+}
+
+// 写回 = 前段 + 收口 + 标题行 + 正文(rstrip 后补单个 \n; 空则不补) + (后段非空则空行) + 后段
+// 承诺: bodyEnd 之后的内容逐字节不动; 标题前允许多一个空行
+function spliceSection(content, loc, newBody, heading) {
+  const before = content.slice(0, loc.headingStart);
+  const after = content.slice(loc.bodyEnd);
+  let out = before;
+  if (out.length > 0) {
+    if (!out.endsWith("\n")) out += "\n";
+    if (!/\n\r?\n$/.test(out)) out += "\n";
+  }
+  out += "## " + heading + "\n";
+  const body = typeof newBody === "string" ? newBody.replace(/\s+$/, "") : "";
+  if (body) out += body + "\n";
+  if (after.length > 0) out += "\n";
+  out += after;
+  return out;
+}
+
+// 文件存在但没有节: 追加到末尾(收口规则同 spliceSection)
+function appendSection(content, heading, body) {
+  const c = typeof content === "string" ? content : "";
+  const loc = { headingStart: c.length, bodyStart: c.length, bodyEnd: c.length };
+  return spliceSection(c, loc, body, heading);
+}
+
+function normalizeNewlines(s) {
+  return String(s).replace(/\r\n?/g, "\n");
+}
+
+// 去尾部空行, 留单个 \n; 全空 → ""
+function trimBody(body) {
+  const t = typeof body === "string" ? body.replace(/\s+$/, "") : "";
+  return t ? t + "\n" : "";
+}
+
+// 块内任何一行以 #×1–6 + 空格开头 → 行首加 \; #hashtag 不动
+function escapeHeadingLines(block) {
+  return String(block).replace(/^(#{1,6} )/gm, "\\$1");
+}
+// 代码围栏行也要转义: 一条含奇数个 ``` 的消息会让节的扫描进入"围栏内", 后面用户的标题不再算节的终点, 节吞掉用户内容。
+// 行首 \``` 在 CommonMark 里是字面反引号, 不再是围栏。与 # 同款全转义(不区分成对与否, 规则一句话讲清)。
+function escapeFenceLines(block) {
+  return String(block).replace(/^( {0,3})(```|~~~)/gm, "$1\\$2");
+}
+
+// ---------- 模板 ----------
+
+const TEMPLATE_PLACEHOLDER_RE = /\{\{title\}\}|\{\{(date|time)(?::([^}]*))?\}\}/g;
+
+// ctx = { dateStr, now(Date), title, momentLib }
+function renderTemplate(tpl, ctx) {
+  const c = ctx || {};
+  const momentLib = c.momentLib;
+  return String(tpl).replace(TEMPLATE_PLACEHOLDER_RE, (m, kind, fmt) => {
+    if (!kind) return c.title == null ? "" : String(c.title);
+    if (kind === "date") return momentLib(c.dateStr, "YYYY-MM-DD").format(fmt || "YYYY-MM-DD");
+    return momentLib(c.now || new Date()).format(fmt || "HH:mm");
+  });
+}
+
+// ---------- 外来文件判定(B1) ----------
+
+// 非空且 frontmatter 里没有 source: wechat-diary → true
+function isForeignFile(content) {
+  if (typeof content !== "string" || content.trim() === "") return false;
+  const lines = content.split("\n");
+  if (!FM_DELIM_LINE_RE.test(lines[0])) return true;
+  for (let i = 1; i < lines.length; i++) {
+    if (FM_DELIM_LINE_RE.test(lines[i])) {
+      for (let j = 1; j < i; j++) {
+        if (/^source:\s*["']?wechat-diary["']?\s*\r?$/.test(lines[j])) return false;
+      }
+      return true;
+    }
+  }
+  return true;
+}
+
+// ---------- 测试用迷你 moment(只给 tests 的 obsidian 桩用) ----------
+
+// 撤回最后一条消息块(纯函数, 独立模式对全文、共用模式对节正文同一套规则)。返回 { ok, removed, content }。
+function removeLastBlock(content) {
+  const parts = content.split("\n\n");
+  let lastMsgI = -1;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    if (isMessageBlock(parts[i].trim())) { lastMsgI = i; break; }
+  }
+  if (lastMsgI < 0) return { ok: false, removed: null, content };
+  const removed = parts[lastMsgI].trim();
+  const newParts = parts.slice(0, lastMsgI);
+  while (newParts.length) {
+    const tail = newParts[newParts.length - 1].trim();
+    if (!tail || HEADER_FULL_RE.test(tail)) newParts.pop();
+    else break;
+  }
+  // 被删块之后的封存行要保住: 用户「晚安」封存后再「撤回」, 不能连句号一起撤掉(2026-08-19 修)。
+  // 例外: 撤光了(一条内容都不剩)就连封存行一起清, 空页不该留个"今日封存"。
+  if (newParts.some((b) => isMessageBlock(b.trim()))) {
+    for (const b of parts.slice(lastMsgI + 1)) {
+      const t = b.trim();
+      if (t.startsWith("---") || t.startsWith("_(")) newParts.push(t);
+    }
+  }
+  let out = newParts.join("\n\n");
+  if (out && !out.endsWith("\n")) out += "\n";
+  return { ok: true, removed, content: out };
+}
+
+// 封存(纯函数)。返回 { status, n, afterSeal, content }: sealed(这次真写了标记) | already(本来就有, 幂等) | empty(没内容)。
+function sealContent(content, hhmm) {
+  if (!content.trim()) return { status: "empty", n: 0, afterSeal: 0, content };
+  const n = countMessages(content);
+  if (!n) return { status: "empty", n: 0, afterSeal: 0, content }; // 只剩 frontmatter/标题(全撤回了): 没东西可封
+  const idx = content.lastIndexOf(CLOSING_MARKER);
+  if (idx >= 0) return { status: "already", n, afterSeal: countMessages(content.slice(idx)), content };
+  return { status: "sealed", n, afterSeal: 0, content: content + "\n\n---\n" + CLOSING_MARKER + " " + hhmm + ")_\n" };
+}
+
 class DiaryWriter {
   constructor(plugin, ai) { this.plugin = plugin; this.ai = ai; }
 
+  // ── 路径层(#15/D13): 根目录 + 路径格式(moment) + 附件位置三模式。默认值 = 0.3.1 的固定布局。
+  _root() {
+    const f = this.plugin.settings.diaryFolder || "日记";   // 兜底与 0.3.1 同款, 不多做清洗(设置页存进来的已 trim)
+    return f === "/" ? "" : normalizePath(f);   // "/" = 库根目录(核心每日笔记的默认位置)
+  }
+  _fmt() { return this.plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat; }
+  _join(root, rel) { return normalizePath(root ? root + "/" + rel : rel); }
+  _shared() { return !!this.plugin.settings.sharedDailyNote; }
+  _heading() { return String(this.plugin.settings.sectionHeading || DEFAULT_SETTINGS.sectionHeading).trim() || DEFAULT_SETTINGS.sectionHeading; }
+
   diaryPath(dateStr) {
-    const folder = normalizePath(this.plugin.settings.diaryFolder || "日记");
-    return normalizePath(folder + "/" + dateStr.slice(0, 4) + "/" + dateStr + ".md");
+    return this._join(this._root(), renderPath(this._fmt(), dateStr, moment) + ".md");
+  }
+
+  // 附件目录: diary(现状)= 日记/attachments/2026; custom = 用户格式串渲染; obsidian 模式在 resolveAttachmentPath 里换算
+  _attachmentDir(dateStr) {
+    const st = this.plugin.settings;
+    const mode = st.attachmentMode || "diary";
+    if (mode === "custom") {
+      const folder = String(st.attachmentFolder || "").trim();
+      const sub = String(st.attachmentSubFormat || "").trim();
+      const base = folder === "/" ? "" : (folder ? normalizePath(folder) : "");
+      const rel = sub ? renderPath(sub, dateStr, moment) : "";
+      if (base || rel) return this._join(base, rel);   // 都没选 → 落到默认位置
+    }
+    return this._join(this._root(), "attachments/" + dateStr.slice(0, 4));
+  }
+
+  // 「跟随 Obsidian 的附件设置」: 用官方接口按用户设置(库根/指定文件夹/当前文件旁/子文件夹)换算, 它自建目录并去重文件名。
+  // 来源文件不存在时接口会退到库根目录, 所以共用模式下先把当天的每日笔记建出来(带模板)再问它。
+  async resolveAttachmentPath(dateStr, path) {
+    if ((this.plugin.settings.attachmentMode || "diary") !== "obsidian") return path;
+    const fm = this.plugin.app.fileManager;
+    if (!fm || typeof fm.getAvailablePathForAttachment !== "function") return path;
+    const day = dateStr || logicalTodayStr();
+    const notePath = this.diaryPath(day);
+    try {
+      // 来源文件不存在时接口退到库根目录(两种模式都一样), 先把当天文件建出来: 共用模式带模板建壳, 独立模式建空文件
+      // (之后 _transform 对空文件补 frontmatter+段头, 与直接 create 的字节相同, bindtest【29】已断言)
+      if (!this.plugin.app.vault.getFileByPath(notePath)) {
+        if (this._shared()) { await this._createDayFile(day, ""); this._freshShell = { day, ts: Date.now() }; }
+        else { await this._ensureParents(notePath); await this.plugin.app.vault.create(notePath, ""); }
+      }
+      const resolved = await fm.getAvailablePathForAttachment(path.split("/").pop(), notePath);
+      return resolved ? normalizePath(resolved) : path;
+    } catch (e) {
+      console.error("[wechat-diary] 按 Obsidian 附件设置换算路径失败, 用默认位置:", e && e.message);
+      return path;
+    }
+  }
+
+  webClipFolder() {
+    return normalizePath(this.plugin.settings.webClipFolder || defaultWebClipFolder(this.plugin.settings));
+  }
+
+  webClipPath(article, dateStr) {
+    const url = webClipIdentityUrl(article);
+    const hash = md5Hex(Buffer.from(url, "utf8")).slice(0, 10);
+    const name = dateStr + "-" + safeClipFilename(article.title) + "-" + hash + ".md";
+    return normalizePath(this.webClipFolder() + "/" + dateStr.slice(0, 4) + "/" + name);
+  }
+
+  webClipAssetFolder(article, dateStr) {
+    const url = webClipIdentityUrl(article);
+    const hash = md5Hex(Buffer.from(url, "utf8")).slice(0, 10);
+    return normalizePath(this.webClipFolder() + "/assets/" + dateStr.slice(0, 4) + "/" + dateStr + "-" + hash);
+  }
+
+  async _localizeWebClipImages(article, dateStr) {
+    const vault = this.plugin.app.vault;
+    const images = Array.isArray(article.images) ? article.images : [];
+    let markdown = String(article.markdown || "");
+    let imageCount = 0;
+    let imageFailed = 0;
+    const imageFailures = [];
+    const folder = this.webClipAssetFolder(article, dateStr);
+    for (let i = 0; i < images.length; i++) {
+      const image = images[i];
+      if (!image || !image.token || !markdown.includes(image.token)) continue;
+      let replacement = "";
+      if (image.buffer && image.ext) {
+        try {
+          const buf = Buffer.isBuffer(image.buffer) ? image.buffer : Buffer.from(image.buffer);
+          const name = String(i + 1).padStart(2, "0") + "-" + md5Hex(buf).slice(0, 10) + "." + image.ext;
+          const path = normalizePath(folder + "/" + name);
+          await this._ensureParents(path);
+          if (!vault.getAbstractFileByPath(path)) {
+            await vault.createBinary(path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+          }
+          replacement = "![[" + path + "]]";
+          imageCount += 1;
+        } catch (e) {
+          console.error("[wechat-diary] 保存网页正文图片失败:", e);
+          imageFailed += 1;
+          imageFailures.push({ url: image.url || "", error: "写入 Vault 失败: " + String((e && e.message) || e) });
+        }
+      } else if (!image.skipped) {
+        imageFailed += 1;
+        imageFailures.push({ url: image.url || "", error: image.error || "图片下载失败" });
+      }
+      if (!replacement) {
+        const label = (image.skipped ? "查看原图：" : "图片未保存：") + (image.alt || "图片");
+        replacement = image.url ? "[" + label.replace(/[\[\]]/g, "") + "](<" + image.url + ">)" : "_" + label + "_";
+      }
+      markdown = markdown.split(image.token).join(replacement);
+    }
+    return { ...article, markdown, imageTotal: images.length, imageCount, imageFailed, imageFailures };
+  }
+
+  async _findWebClip(url) {
+    const normalized = normalizeWebUrl(url) || String(url || "");
+    const vault = this.plugin.app.vault;
+    if (!Array.isArray(this.plugin.data.webClips)) this.plugin.data.webClips = [];
+    const list = this.plugin.data.webClips;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const rec = list[i];
+      if (!rec || !rec.path || !vault.getAbstractFileByPath(rec.path)) {
+        list.splice(i, 1);
+        continue;
+      }
+      if (rec.url === normalized) return rec.path;
+    }
+    // data.json 被清掉也尽量不重复剪藏: 文件名末尾带 URL hash, 只读极少量候选核对 frontmatter。
+    const hash = md5Hex(Buffer.from(normalized, "utf8")).slice(0, 10);
+    const folder = this.webClipFolder() + "/";
+    const files = typeof vault.getMarkdownFiles === "function"
+      ? vault.getMarkdownFiles()
+      : (typeof vault.getFiles === "function" ? vault.getFiles() : []);
+    for (const f of files) {
+      if (!f || !f.path || !f.path.startsWith(folder) || !f.path.endsWith("-" + hash + ".md")) continue;
+      try {
+        const content = await vault.cachedRead(f);
+        if (content.includes("source_url: " + yamlString(normalized)) ||
+            content.includes("canonical_url: " + yamlString(normalized)) ||
+            content.includes("identity_url: " + yamlString(normalized))) return f.path;
+      } catch (e) { /* 单篇读失败不阻断其他候选 */ }
+    }
+    return "";
+  }
+
+  _rememberWebClip(url, path) {
+    const normalized = normalizeWebUrl(url) || String(url || "");
+    if (!Array.isArray(this.plugin.data.webClips)) this.plugin.data.webClips = [];
+    const list = this.plugin.data.webClips;
+    for (let i = list.length - 1; i >= 0; i--) if (list[i] && list[i].url === normalized) list.splice(i, 1);
+    list.push({ url: normalized, path });
+    if (list.length > 300) list.splice(0, list.length - 300);
+  }
+
+  // 只保存（或复用）一篇剪藏，不碰今日日记。多链接消息靠这个阶段先攒齐所有入口。
+  async saveWebClip(article, note, dateStr) {
+    const day = dateStr || logicalTodayStr();
+    const vault = this.plugin.app.vault;
+    const identityUrl = webClipIdentityUrl(article);
+    let path = await this._findWebClip(identityUrl);
+    let reused = Boolean(path);
+    // 早期同 URL 文件可能不含图片元数据。重新发送后若抓到更多图片，另存改进版，保留旧文件不覆盖。
+    const freshImageCount = (article.images || []).filter((image) => image && image.buffer).length;
+    if (path && freshImageCount) {
+      try {
+        const oldFile = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
+        const oldContent = oldFile ? await vault.cachedRead(oldFile) : "";
+        const oldCountMatch = /^web_clip_image_count:\s*(\d+)/m.exec(oldContent);
+        const oldImageCount = oldCountMatch ? Number(oldCountMatch[1]) : -1;
+        if (freshImageCount > oldImageCount) { path = ""; reused = false; }
+      } catch (e) { /* 读不到旧文件时继续复用，避免误覆盖 */ }
+    }
+    let preparedArticle = article;
+    if (!path) {
+      path = this.webClipPath(article, day);
+      try {
+        preparedArticle = await this._localizeWebClipImages(article, day);
+        await this._ensureParents(path);
+        // URL hash 已让冲突极罕见; 真遇到同名用户文件时不覆盖, 加随机尾巴。
+        for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) path = path.replace(/\.md$/, "-" + randHex(4) + ".md");
+        await vault.create(path, formatWebClipMarkdown(preparedArticle, note));
+      } catch (e) {
+        console.error("[wechat-diary] 保存网页剪藏失败:", e);
+        return { path: "", title: article.title || "网页剪藏", reused: false, identityUrl,
+          diskFull: String(e && e.message).includes("ENOSPC") };
+      }
+    }
+    return { path, title: article.title || "网页剪藏", reused, identityUrl, diskFull: false,
+      imageCount: preparedArticle.imageCount || 0, imageFailed: preparedArticle.imageFailed || 0 };
+  }
+
+  // 把原句和一条或多条剪藏入口一次写成同一个消息块，保持段数和撤回边界稳定。
+  async appendWebClipEntries(entries, originalText, dateStr) {
+    const day = dateStr || logicalTodayStr();
+    const ready = (entries || []).filter((entry) => entry && entry.path);
+    if (!ready.length) return { n: 0, sealed: false, diskFull: false };
+    try {
+      const links = ready.map((entry) => {
+        const alias = ("🔖 " + (entry.title || "网页剪藏")).replace(/[|\[\]\r\n]/g, " ").replace(/\s+/g, " ").trim();
+        return "[[" + entry.path + "|" + alias + "]]";
+      });
+      const original = normalizeDiaryBlockText(originalText);
+      const block = (original ? [original, ...links] : links).join("\n");
+      const finalContent = await this._appendBlock(day, hhmmStr(), block);
+      for (const entry of ready) this._rememberWebClip(entry.identityUrl, entry.path);
+      return { n: this._count(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false }; // _count: 外来文件只数我们段头后的块(回执=送达确认)
+    } catch (e) {
+      console.error("[wechat-diary] 网页剪藏入口写入日记失败:", e);
+      return { n: 0, sealed: false, diskFull: String(e && e.message).includes("ENOSPC") };
+    }
+  }
+
+  // 兼容单链接调用：保存剪藏后，原句和入口仍作为一个日记块落盘。
+  // 返回 {n, sealed, path, title, reused}; n===0 表示日记入口没写成。
+  async writeWebClip(article, originalText, note, dateStr) {
+    const saved = await this.saveWebClip(article, note, dateStr);
+    if (!saved.path) return { ...saved, n: 0, sealed: false };
+    const appended = await this.appendWebClipEntries([saved], originalText, dateStr);
+    return { ...saved, ...appended };
   }
 
   // 附件与日记同根、按年分子目录: 日记/attachments/2026/2026-08-12-2104-a3f1.jpg
   attachmentPath(dateStr, ext) {
-    const folder = normalizePath(this.plugin.settings.diaryFolder || "日记");
     const name = dateStr + "-" + hhmmStr().replace(":", "") + "-" + randHex(4) + "." + ext;
-    return normalizePath(folder + "/attachments/" + dateStr.slice(0, 4) + "/" + name);
+    return normalizePath(this._attachmentDir(dateStr) + "/" + name);
   }
 
   // 带原名的附件路径(文件/视频/语音兜底用): 日记/attachments/2026/2026-08-19-2130-检查报告.pdf。
   // 原名保留(病历 PDF 靠名字找), 但要洗掉 wikilink/路径的毒字符; 超长截断保扩展名。
   attachmentPathNamed(dateStr, origName) {
-    const folder = normalizePath(this.plugin.settings.diaryFolder || "日记");
     let name = String(origName || "").split(/[/\\]/).pop() || "";
     name = name.replace(/[\u0000-\u001f:*?"<>|#^\[\]]/g, "").trim();
     if (!name || /^\.+$/.test(name)) name = "file.bin";
@@ -3208,7 +4778,7 @@ class DiaryWriter {
       base = [...base].slice(0, Math.max(1, [...base].length - 8)).join("");
     }
     name = dateStr + "-" + hhmmStr().replace(":", "") + "-" + base + ext;
-    return normalizePath(folder + "/attachments/" + dateStr.slice(0, 4) + "/" + name);
+    return normalizePath(this._attachmentDir(dateStr) + "/" + name);
   }
 
   // 存一个二进制附件 + 在当天笔记里插一个 wikilink 块(marker 是块前缀, 语音兜底用 "🎤")。
@@ -3217,6 +4787,7 @@ class DiaryWriter {
     const day = dateStr || logicalTodayStr();
     const vault = this.plugin.app.vault;
     try {
+      path = await this.resolveAttachmentPath(day, path);
       await this._ensureParents(path);
       // 同分钟同名撞车(极小概率): 加随机尾巴重试几次
       for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) {
@@ -3235,7 +4806,7 @@ class DiaryWriter {
         if (polished) block += "\n" + polished;
       }
       const finalContent = await this._appendBlock(day, hhmmStr(), block);
-      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false, path };
+      return { n: this._count(finalContent), sealed: finalContent.includes(CLOSING_MARKER), diskFull: false, path };
     } catch (e) {
       console.error("[wechat-diary] 附件插入日记失败:", e);
       // 附件已落盘只是没插进笔记——不删文件, 留给用户手动捞
@@ -3248,7 +4819,7 @@ class DiaryWriter {
     const day = dateStr || logicalTodayStr();
     try {
       const finalContent = await this._appendBlock(day, hhmmStr(), "![[" + path + "]]");
-      return { n: countMessages(finalContent), sealed: finalContent.includes(CLOSING_MARKER) };
+      return { n: this._count(finalContent), sealed: finalContent.includes(CLOSING_MARKER) };
     } catch (e) {
       console.error("[wechat-diary] 引用附件失败:", e);
       return { n: 0, sealed: false };
@@ -3283,15 +4854,166 @@ class DiaryWriter {
     }
   }
 
-  // 追加一个块。同一分钟共用段头, 文件不存在则连 frontmatter 一起建。返回最终全文。
-  _appendBlock(day, timestamp, block) {
-    return this._transform(this.diaryPath(day), (existing) => {
+  firstPrefix(day) { return this._shared() ? firstOfDayPrefixShared(day || logicalTodayStr(), this._heading()) : FIRST_OF_DAY_PREFIX; }
+
+  // 段数: 共用模式拿到的是节正文, 直接数; 独立模式的外来文件(不是插件建的, #15 B1)只数我们段头之后的块——
+  // 否则第一条回执会把用户自己的段落数进"今天第 N 段"(送达确认信号不能虚报)
+  _count(text) {
+    if (!this._shared() && isForeignFile(text)) {
+      const i = text.search(HEADER_RE_G);
+      return i >= 0 ? countMessages(text.slice(i)) : 0;
+    }
+    return countMessages(text);
+  }
+
+  // ── 共用文件模式(#15/D13): 插件只认、只动当天每日笔记里「## <标题>」一节 ─────────
+  // 统一入口。独立模式 = 现有 _transform(全文, 一字不改); 共用模式 = 只对节正文跑 fn, 节外逐字节不动。
+  // 返回 fn 作用范围的最终文本(独立=全文, 共用=节正文), 调用方的段数/封存判断只看它。
+  // opts.create: 文件不存在/没有节时允许创建——只有追加块的路径传 true; 撤回/封存/计数不建文件、不建节、不套模板。
+  // 返回 null = 没文件或没节且不允许创建。
+  async _editDay(day, fn, opts) {
+    const create = !!(opts && opts.create);
+    const path = this.diaryPath(day);
+    const vault = this.plugin.app.vault;
+    if (!this._shared()) {
+      if (!create && !vault.getFileByPath(path)) return null;
+      return this._transform(path, fn);
+    }
+    const heading = this._heading();
+    let file = vault.getFileByPath(path);
+    if (!file) {
+      if (!create) return null;
+      const body = trimBody(fn(""));
+      try {
+        await this._createDayFile(day, body);
+        return body;
+      } catch (e) {
+        file = vault.getFileByPath(path);
+        if (!file) throw e;
+        // TOCTOU: 别人(每日笔记插件/Templater)刚建了它 → 走下面的普通 splice; 模板只在 create 路径用, 永不进 process
+      }
+    }
+    if (!create) {
+      // 撤回/封存: 先看有没有节, 没有就不碰文件(免得空操作也改 mtime 惊动同步盘)
+      const cur = await vault.cachedRead(file);
+      if (!locateSection(cur, heading)) return null;
+    }
+    let out = null;
+    await vault.process(file, (content) => {
+      const loc = locateSection(content, heading);
+      if (!loc) {
+        const body = trimBody(fn(""));
+        out = body;
+        return body ? appendSection(content, heading, body) : content;
+      }
+      const body = trimBody(normalizeNewlines(content.slice(loc.bodyStart, loc.bodyEnd)));
+      const nb = trimBody(fn(body));
+      out = nb;
+      return nb === body ? content : spliceSection(content, loc, nb, heading);
+    });
+    return out;
+  }
+
+  // 当天的每日笔记不存在: 按用户模板渲染 + 我们那一节, **一次** create(模板本身含同名标题就填进去, 不会出现两个标题)。
+  // body 为空 = 只建壳(附件接口/「打开今天的日记」用), 有模板写模板, 没模板建空文件。
+  async _createDayFile(day, body) {
+    const vault = this.plugin.app.vault;
+    const path = this.diaryPath(day);
+    const heading = this._heading();
+    let tpl = "";
+    const tp = String(this.plugin.settings.templatePath || "").trim();
+    if (tp) {
+      const tf = vault.getFileByPath(normalizePath(tp));
+      let problem = "";
+      if (tf) {
+        try { tpl = await vault.cachedRead(tf); this.plugin._templateMissing = ""; } catch (e) { tpl = ""; problem = "读取失败"; console.error("[wechat-diary] 模板读取失败:", tp, e && e.message); }
+      } else problem = "没找到";
+      if (problem) {
+        // 微信回执照常(内容确实记了), 但 Obsidian 侧要响亮: 微信先到的每一天都会丢模板——每个逻辑日提醒一次, 设置页 desc 标红
+        this.plugin._templateMissing = tp;
+        if (this.plugin._templateNoticedDay !== day) {
+          this.plugin._templateNoticedDay = day;
+          new Notice("微信随手记: 每日笔记模板" + problem + ": " + tp + " (今天的文件已按无模板创建)", 10000);
+        }
+      }
+    }
+    let content = tpl ? renderTemplate(tpl, { dateStr: day, now: new Date(), title: path.split("/").pop().replace(/\.md$/, ""), momentLib: moment }) : "";
+    if (body) {
+      const loc = locateSection(content, heading);
+      content = loc ? spliceSection(content, loc, body, heading) : appendSection(content, heading, body);
+    }
+    await this._ensureParents(path);
+    await vault.create(path, content);
+    return content;
+  }
+
+  // ── Templater 竞态复核(共用模式) ──
+  // 插件自己建的当天文件会被 Templater 的「新文件创建时触发」再处理一遍: 它 read→modify 整篇写回, 不看是谁建的,
+  // 连发时窗口内写进节里的每一条都可能被快照抹掉, 而回执已说「记下来啦」。所以: 文件是插件建的(带正文建, 或先建壳再追加)
+  // 之后写进节里的每一块都登记, 最后一次写入 1.5s 后读一次文件, 缺哪条按原顺序补哪条(连发只复核一次)。
+  // 用户在窗口内「撤回」掉的块从清单里移除, 不补; 「撤回」时节已被抹掉(找不到节)的, 补回时丢掉最后一条——那正是用户想撤的;
+  // 封存不作废: 补回正文后若本日真封存过, 再补封存行。(v1 用"任何撤回/封存都作废"会把「第一条+晚安」积压批次的第一条丢掉。)
+  _registerPending(day, timestamp, block, fresh) {
+    const plugin = this.plugin;
+    let pc = plugin._pendingCheck;
+    if (!pc || pc.day !== day) {
+      if (!fresh) return;
+      pc = plugin._pendingCheck = { day, items: [], timer: null, dropLast: false, sealed: false };
+    }
+    pc.items.push({ timestamp, block });
+    const timerFn = (typeof window !== "undefined" && window.setTimeout) ? window.setTimeout : setTimeout;
+    const clearFn = (typeof window !== "undefined" && window.clearTimeout) ? window.clearTimeout : clearTimeout;
+    if (pc.timer) clearFn(pc.timer);
+    pc.timer = timerFn(() => { this._runPendingCheck().catch((e) => console.error("[wechat-diary] 复核补写失败:", e && e.message)); }, 1500);
+  }
+  _pendingFor(day) {
+    const pc = this.plugin._pendingCheck;
+    return pc && pc.day === day ? pc : null;
+  }
+  async _runPendingCheck() {
+    const plugin = this.plugin;
+    const pc = plugin._pendingCheck;
+    plugin._pendingCheck = null;
+    if (!pc || plugin._unloaded || !this._shared()) return;
+    const vault = plugin.app.vault;
+    const file = vault.getFileByPath(this.diaryPath(pc.day));
+    if (!file) return;
+    const cur = await vault.cachedRead(file);
+    const loc = locateSection(cur, this._heading());
+    const body = loc ? normalizeNewlines(cur.slice(loc.bodyStart, loc.bodyEnd)) : "";
+    let items = pc.items;
+    if (pc.dropLast && items.length) items = items.slice(0, -1);
+    const missing = items.filter((it) => !body.includes(it.block.trim()));
+    if (!missing.length) return;
+    console.warn("[wechat-diary] 建文件后节正文被别的插件覆盖, 补回 " + missing.length + " 条");
+    for (const it of missing) await this._appendRaw(pc.day, it.timestamp, it.block);
+    if (pc.sealed) await this.finalizeDay(pc.day);
+    new Notice("微信随手记: 今天的每日笔记被别的插件覆盖过, 已补回 " + missing.length + " 条微信记录", 10000);
+  }
+
+  // 追加一个块。同一分钟共用段头, 文件不存在则连 frontmatter 一起建(共用模式: 不写 frontmatter/标题, 见 _editDay)。
+  // 返回最终全文(共用模式: 节正文)。
+  async _appendBlock(day, timestamp, block) {
+    if (!this._shared()) return this._appendRaw(day, timestamp, block);
+    block = escapeFenceLines(escapeHeadingLines(block)); // 块内任何 `#… `/``` 行都会破坏节的边界; 独立模式不动(零影响)
+    const vault = this.plugin.app.vault;
+    const existed = !!vault.getFileByPath(this.diaryPath(day));
+    const out = await this._appendRaw(day, timestamp, block);
+    const shell = this._freshShell;
+    const fresh = !existed || !!(shell && shell.day === day && Date.now() - shell.ts < 3000);
+    if (fresh) this._freshShell = null;
+    this._registerPending(day, timestamp, block, fresh);
+    return out;
+  }
+  _appendRaw(day, timestamp, block) {
+    return this._editDay(day, (existing) => {
       if (existing) {
         const chunk = canMergeIntoLastHeader(existing, timestamp)
           ? "\n" + block + "\n"
           : "\n\n**" + timestamp + "**\n\n" + block + "\n";
         return existing + chunk;
       }
+      if (this._shared()) return "**" + timestamp + "**\n\n" + block + "\n";
       const header = "---\n" +
         "date: " + day + "\n" +
         "weekday: " + weekdayForDate(day) + "\n" +
@@ -3299,7 +5021,7 @@ class DiaryWriter {
         "---\n\n" +
         "# " + day + "\n";
       return header + "\n\n**" + timestamp + "**\n\n" + block + "\n";
-    });
+    }, { create: true });
   }
 
   // 写一条。返回 { reply, n }。永不抛。
@@ -3311,12 +5033,8 @@ class DiaryWriter {
     const day = dateStr || logicalTodayStr();
 
     // 契约规则 6: 块内空行收敛为单个换行, 一次发送 = 一个块 = 一条消息
-    let polished = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(NORMALIZE_BLANK_RE, "\n").trim();
+    let polished = normalizeDiaryBlockText(text, !isVoice);
     if (isVoice) polished = "🎤 " + polished;
-    else if (polished.startsWith("# ") || polished.startsWith("---") || polished.startsWith("_(")) {
-      // 首行撞契约排除前缀会让整块"隐形"(不计数、undo 误删更早内容), 反斜杠转义
-      polished = "\\" + polished;
-    }
     const timestamp = hhmmStr();
 
     let finalContent;
@@ -3330,10 +5048,10 @@ class DiaryWriter {
       return { reply: "⚠️ 这条没记上! 写入出了问题, 等一会儿重发一次", n: 0 };
     }
 
-    const n = countMessages(finalContent);
+    const n = this._count(finalContent);
     const voiceMark = isVoice ? "🎤 " : "";
     let reply = voiceMark + "记下来啦~ 今天第 " + n + " 段 ✍️";
-    if (n === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
+    if (n === 1) reply = this.firstPrefix(day) + reply + FIRST_OF_DAY_TIPS;
     // sealed: 今天已有封存标记(夜间收尾提示据此闭嘴)
     return { reply, n, sealed: finalContent.includes(CLOSING_MARKER) };
   }
@@ -3345,7 +5063,12 @@ class DiaryWriter {
       const path = this.diaryPath(dateStr || logicalTodayStr());
       const file = vault.getFileByPath ? vault.getFileByPath(path) : vault.getAbstractFileByPath(path);
       if (!file) return 0;
-      return countMessages(await vault.cachedRead(file));
+      const content = await vault.cachedRead(file);
+      if (this._shared()) {
+        const loc = locateSection(content, this._heading());
+        return loc ? countMessages(normalizeNewlines(content.slice(loc.bodyStart, loc.bodyEnd))) : 0;
+      }
+      return this._count(content); // 外来文件(#15 B1)只数我们段头之后的块
     } catch (e) { return 0; }
   }
 
@@ -3358,9 +5081,10 @@ class DiaryWriter {
     let path = "";
     try {
       path = this.attachmentPath(day, ext);
-      await this._ensureParents(path);
       // 同一分钟连发多图时 4 位随机撞名的概率极小, 但撞了就是覆盖别人的图, 重摇几次
       for (let i = 0; i < 5 && vault.getAbstractFileByPath(path); i++) path = this.attachmentPath(day, ext);
+      path = await this.resolveAttachmentPath(day, path); // obsidian 模式换算到用户设的位置(先换算再建目录, 别留空文件夹)
+      await this._ensureParents(path);
       // Buffer 是内存池上的视图, 直接给 .buffer 会把整个池子写进去, 必须切出自己那段
       await vault.createBinary(path, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
     } catch (e) {
@@ -3377,50 +5101,49 @@ class DiaryWriter {
       // 图已经落盘了, 只是没插进笔记 —— 不删文件, 留给用户手动捞
       return { n: 0, diskFull: String(e && e.message).includes("ENOSPC") };
     }
-    return { n: countMessages(finalContent), diskFull: false, sealed: finalContent.includes(CLOSING_MARKER) };
+    return { n: this._count(finalContent), diskFull: false, sealed: finalContent.includes(CLOSING_MARKER) };
   }
 
   // 撤回最后一条消息; 孤儿段头一并清理。返回是否删了东西。
   // 返回 { ok, removed }: removed = 被删块的原文(回执预览用), 失败/无可撤时 null。
   async undoLastBlock(dateStr) {
-    const path = this.diaryPath(dateStr || logicalTodayStr());
+    const day = dateStr || logicalTodayStr();
+    const path = this.diaryPath(day);
     const vault = this.plugin.app.vault;
-    const file = vault.getFileByPath(path);
-    if (!file) return { ok: false, removed: null };
     let ok = false;
     let removed = null;
+    let foreign = false;
     try {
-      await vault.process(file, (content) => {
-        const parts = content.split("\n\n");
-        let lastMsgI = -1;
-        for (let i = parts.length - 1; i >= 0; i--) {
-          if (isMessageBlock(parts[i].trim())) { lastMsgI = i; break; }
-        }
-        if (lastMsgI < 0) return content;
-        removed = parts[lastMsgI].trim();
-        const newParts = parts.slice(0, lastMsgI);
-        while (newParts.length) {
-          const tail = newParts[newParts.length - 1].trim();
-          if (!tail || HEADER_FULL_RE.test(tail)) newParts.pop();
-          else break;
-        }
-        // 被删块之后的封存行要保住: 用户「晚安」封存后再「撤回」, 不能连句号一起撤掉(2026-08-19 修)。
-        // 例外: 撤光了(一条内容都不剩)就连封存行一起清, 空页不该留个"今日封存"。
-        if (newParts.some((b) => isMessageBlock(b.trim()))) {
-          for (const b of parts.slice(lastMsgI + 1)) {
-            const t = b.trim();
-            if (t.startsWith("---") || t.startsWith("_(")) newParts.push(t);
+      if (this._shared()) {
+        // 共用模式: 只在节正文里撤; 没文件/没节 → 没东西可撤; 撤到空只清正文, 标题行留着(可能是用户写在模板里的)
+        const r = await this._editDay(day, (body) => {
+          const res = removeLastBlock(body);
+          if (res.ok) { ok = true; removed = res.removed; }
+          return res.content;
+        }, { create: false });
+        const pc = this._pendingFor(day);
+        if (r === null) { if (pc) pc.dropLast = true; return { ok: false, removed: null }; } // 节刚被抹掉: 复核补回时丢掉最后一条
+        if (ok && pc) { const k = pc.items.findIndex((it) => it.block.trim() === removed); if (k >= 0) pc.items.splice(k, 1); }
+      } else {
+        const file = vault.getFileByPath(path);
+        if (!file) return { ok: false, removed: null };
+        await vault.process(file, (content) => {
+          // 外来文件护栏(#15 B1): 不是插件建的文件(没有 source: wechat-diary 的 frontmatter)——只有我们段头之后没有块时才拒;
+          // 有块时全文最后一个消息块必在段头之后, removeLastBlock 只删它和孤儿段头, 用户段头之前的内容原样保留(与 0.3.1 结果一致)
+          if (isForeignFile(content)) {
+            const i = content.search(HEADER_RE_G);
+            if (i < 0 || !countMessages(content.slice(i))) { foreign = true; return content; }
           }
-        }
-        let out = newParts.join("\n\n");
-        if (out && !out.endsWith("\n")) out += "\n";
-        ok = true;
-        return out;
-      });
+          const res = removeLastBlock(content);
+          if (res.ok) { ok = true; removed = res.removed; }
+          return res.content;
+        });
+      }
     } catch (e) {
       console.error("[wechat-diary] 撤回失败:", e);
       return { ok: false, removed: null };
     }
+    if (foreign) return { ok: false, removed: null, foreign: true };
     return { ok, removed: ok ? removed : null };
   }
 
@@ -3428,29 +5151,39 @@ class DiaryWriter {
   // | "empty"(今天没内容, 不写) | "error"; n=当天段数; afterSeal=封存线之后又补记的段数。
   // 调用方据此区分: 跨天"自动收尾"告知只给没自己收尾的人; 告别语回"补的也收好了"还是只道别。
   async finalizeDay(dateStr) {
-    const path = this.diaryPath(dateStr || logicalTodayStr());
+    const day = dateStr || logicalTodayStr();
+    const path = this.diaryPath(day);
     const vault = this.plugin.app.vault;
-    const file = vault.getFileByPath(path);
-    if (!file) return { status: "empty", n: 0, afterSeal: 0 };
     let status = "empty", n = 0, afterSeal = 0;
+    const fn = (content) => {
+      // 外来文件(#15 B1, 独立模式): 我们段头之后没有块就不落笔(不往用户的每日笔记里塞封存行), 有块时段数只数段头之后
+      if (!this._shared() && isForeignFile(content)) {
+        const i = content.search(HEADER_RE_G);
+        const own = i >= 0 ? countMessages(content.slice(i)) : 0;
+        if (!own) { status = "empty"; n = 0; afterSeal = 0; return content; }
+        const r = sealContent(content, hhmmStr());
+        status = r.status; n = own; afterSeal = r.afterSeal;
+        return r.content;
+      }
+      const r = sealContent(content, hhmmStr());
+      status = r.status; n = r.n; afterSeal = r.afterSeal;
+      return r.content;
+    };
     try {
-      await vault.process(file, (content) => {
-        if (!content.trim()) return content;
-        n = countMessages(content);
-        if (!n) return content; // 只剩 frontmatter/标题(全撤回了): 没东西可封
-        const idx = content.lastIndexOf(CLOSING_MARKER);
-        if (idx >= 0) {
-          status = "already";
-          afterSeal = countMessages(content.slice(idx));
-          return content;
-        }
-        status = "sealed";
-        return content + "\n\n---\n" + CLOSING_MARKER + " " + hhmmStr() + ")_\n";
-      });
+      if (this._shared()) {
+        // 共用模式: 封存行写在节正文末尾; 没文件/没节 → empty, 不建文件不建节
+        const r = await this._editDay(day, fn, { create: false });
+        if (r === null) return { status: "empty", n: 0, afterSeal: 0 };
+      } else {
+        const file = vault.getFileByPath(path);
+        if (!file) return { status: "empty", n: 0, afterSeal: 0 };
+        await vault.process(file, fn);
+      }
     } catch (e) {
       console.error("[wechat-diary] 封存失败:", e);
       return { status: "error", n, afterSeal };
     }
+    if (status === "sealed" && this._shared()) { const pc = this._pendingFor(day); if (pc) pc.sealed = true; }
     return { status, n, afterSeal };
   }
 }
@@ -3815,7 +5548,7 @@ class DiaryAgent {
   get profile() { return this.plugin.data.profile; }
   get session() { return this.plugin.data.session; }
 
-  _welcome() { return welcomeText(this.plugin.settings.diaryFolder || "日记"); }
+  _welcome() { return this.writer._shared() ? welcomeTextShared(this.writer._heading()) : welcomeText(this.plugin.settings.diaryFolder || "日记"); }
 
   // 跨天处理(020「午夜割裂」修复: 宽限期 + 显式告知)。
   // 返回 { graceDate?: string, expiredNotice?: string }
@@ -3829,9 +5562,11 @@ class DiaryAgent {
     if (s.entered_date === today) return {};
     // 逻辑日翻页: 自动封存旧的一天(空文件无副作用)。只有这次真写了标记才告知"自动收尾"——
     // 用户昨晚自己说了「晚安」/「结束」的, 句号已经给过了, 不能反过来说是自动收的(2026-08-19 修)
-    const r = await this.writer.finalizeDay(s.entered_date);
+    const prev = s.entered_date;
+    const r = await this.writer.finalizeDay(prev);
     s.entered_date = today;
-    return r && r.status === "sealed" ? { expiredNotice: GRACE_EXPIRED_NOTICE } : {};
+    if (!(r && r.status === "sealed")) return {};
+    return { expiredNotice: this.writer._shared() ? expiredNoticeShared(prev) : GRACE_EXPIRED_NOTICE };
   }
 
   // 写成功后的公共记账: 夜间收尾提示的依据 + 每日提醒的"没写"计数清零。
@@ -3871,11 +5606,133 @@ class DiaryAgent {
       if (!res.n) return null;
       this._noteWrite(res.n, res.sealed);
       let reply = "🎤 记下来啦~ 今天第 " + res.n + " 段 ✍️";
-      if (res.n === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
+      if (res.n === 1) reply = this.writer.firstPrefix(day) + reply + FIRST_OF_DAY_TIPS;
       return reply;
     } catch (e) {
       console.error("[wechat-diary] 语音原声保存失败, 降级纯文字:", e && e.message);
       return null;
+    }
+  }
+
+  async _clipLinks(text, urls, dateStr) {
+    if (this.plugin.settings.webClipBackground === false || typeof this.plugin.enqueueWebClipJob !== "function") {
+      return this._clipLinksSync(text, urls, dateStr);
+    }
+    this.session.last_activity_ts = Date.now();
+    const day = dateStr || logicalTodayStr();
+    const saved = await this.writer.write(text, false, day);
+    if (!saved.n) return "⚠️ 原句没能写入日记，请稍后重发";
+    this._noteWrite(saved.n, saved.sealed);
+    this.plugin.enqueueWebClipJob(() => this._clipLinksSync(text, urls, day, {
+      originalWritten: true, writeN: saved.n, background: true,
+    }));
+    let reply = "链接已记下来，正在后台提取正文和图片；完成后我再告诉你";
+    if (saved.n === 1) reply = this.writer.firstPrefix(day) + reply + FIRST_OF_DAY_TIPS;
+    return reply;
+  }
+
+  async _clipLinksSync(text, urls, dateStr, options) {
+    options = options || {};
+    this.session.last_activity_ts = Date.now();
+    const picked = (urls || []).slice(0, WEB_CLIP_MAX_LINKS_PER_MESSAGE);
+    const overflow = (urls || []).slice(WEB_CLIP_MAX_LINKS_PER_MESSAGE);
+    const note = linkNoteFromText(text, urls);
+    const clipReplies = [];
+    const failed = [];
+    const entries = [];
+    let writeN = options.writeN || 0;
+    let originalWritten = Boolean(options.originalWritten);
+    let noteWritten = false;
+
+    for (const url of picked) {
+      try {
+        const article = await this.plugin.clipper.fetchArticle(url);
+        const res = await this.writer.saveWebClip(article, noteWritten ? "" : note, dateStr);
+        if (!res.path) {
+          const reason = res.diskFull ? "磁盘空间不足" : "保存剪藏文件失败";
+          failed.push({ url, reason });
+          if (!Array.isArray(this.plugin.data.webClipFailures)) this.plugin.data.webClipFailures = [];
+          this.plugin.data.webClipFailures = this.plugin.data.webClipFailures.filter((item) => item && item.url !== url);
+          this.plugin.data.webClipFailures.push({ url, originalText: text, note, date: dateStr || logicalTodayStr(), reason, failedAt: new Date().toISOString(), attempts: 1 });
+          if (this.plugin.data.webClipFailures.length > 50) this.plugin.data.webClipFailures.splice(0, this.plugin.data.webClipFailures.length - 50);
+          continue;
+        }
+        entries.push(res);
+        if (Array.isArray(this.plugin.data.webClipFailures)) {
+          this.plugin.data.webClipFailures = this.plugin.data.webClipFailures.filter((item) => item && item.url !== url);
+        }
+        if (!res.reused && note) noteWritten = true;
+        clipReplies.push(res.reused
+          ? "网页《" + res.title + "》之前存过，已复用 " + this.writer.webClipFolder() + " 中的剪藏"
+          : "网页《" + res.title + "》已存到 " + this.writer.webClipFolder() + " 文件夹");
+      } catch (e) {
+        console.error("[wechat-diary] 网页正文抓取失败:", e && e.message);
+        const reason = (e && e.message) || "未知错误";
+        failed.push({ url, reason });
+        if (!Array.isArray(this.plugin.data.webClipFailures)) this.plugin.data.webClipFailures = [];
+        this.plugin.data.webClipFailures = this.plugin.data.webClipFailures.filter((item) => item && item.url !== url);
+        this.plugin.data.webClipFailures.push({ url, originalText: text, note, date: dateStr || logicalTodayStr(), reason, failedAt: new Date().toISOString(), attempts: 1 });
+        if (this.plugin.data.webClipFailures.length > 50) this.plugin.data.webClipFailures.splice(0, this.plugin.data.webClipFailures.length - 50);
+      }
+    }
+    for (const url of overflow) failed.push({ url, reason: "一条消息最多自动剪藏 " + WEB_CLIP_MAX_LINKS_PER_MESSAGE + " 个链接" });
+
+    // 所有成功入口攒齐后，与原句一次写成一个日记块。
+    if (entries.length) {
+      const appended = await this.writer.appendWebClipEntries(entries, originalWritten ? "" : text, dateStr);
+      if (appended.n) {
+        originalWritten = true;
+        writeN = appended.n;
+        if (!options.background) this._noteWrite(appended.n, appended.sealed);
+        else {
+          this.session.reminder_streak = 0;
+          this.plugin._writeGen = (this.plugin._writeGen || 0) + 1;
+        }
+      } else {
+        failed.push({ url: "", reason: appended.diskFull ? "磁盘空间不足，日记入口未写入" : "日记入口写入失败" });
+      }
+    }
+
+    // 全部剪藏失败时仍保留原句；入口写失败也尽量让原句不丢。
+    if (!originalWritten) {
+      const saved = await this.writer.write(text, false, dateStr);
+      if (saved.n) {
+        originalWritten = true;
+        writeN = saved.n;
+        this._noteWrite(saved.n, saved.sealed);
+      }
+    }
+
+    let reply = options.background ? "" : (writeN ? "记下来啦~ 今天第 " + writeN + " 段 ✍️" : "⚠️ 原句没能写入日记，请稍后重发");
+    if (clipReplies.length) reply += "\n" + clipReplies.join("\n");
+    if (failed.length) {
+      const reason = failed.length === 1 ? failed[0].reason : failed.length + " 个链接未能提取";
+      reply += "\n⚠️ " + reason + "；" + (originalWritten ? "原句已记入今天的日记" : "请稍后重发");
+    }
+    if (!options.background && writeN === 1) reply = this.writer.firstPrefix(dateStr) + reply + FIRST_OF_DAY_TIPS; // 共用模式的开页前缀带日期与节名
+    return reply.trim() || "网页剪藏处理完成";
+  }
+
+  async retryLastWebClipFailure() {
+    const failures = Array.isArray(this.plugin.data.webClipFailures) ? this.plugin.data.webClipFailures : [];
+    const item = failures[failures.length - 1];
+    if (!item || !item.url) return { ok: false, message: "没有待重试的网页剪藏" };
+    try {
+      const article = await this.plugin.clipper.fetchArticle(item.url);
+      const saved = await this.writer.saveWebClip(article, item.note || "", item.date || logicalTodayStr());
+      if (!saved.path) throw new Error(saved.diskFull ? "磁盘空间不足" : "保存剪藏文件失败");
+      const appended = await this.writer.appendWebClipEntries([saved], "", item.date || logicalTodayStr());
+      if (!appended.n) throw new Error(appended.diskFull ? "磁盘空间不足，入口未写入" : "剪藏入口写入失败");
+      const index = failures.indexOf(item);
+      if (index >= 0) failures.splice(index, 1);
+      await this.plugin.persist();
+      return { ok: true, message: "剪藏重试成功：《" + saved.title + "》已保存并补上入口", path: saved.path };
+    } catch (e) {
+      item.attempts = (item.attempts || 1) + 1;
+      item.reason = String((e && e.message) || e || "未知错误");
+      item.failedAt = new Date().toISOString();
+      await this.plugin.persist();
+      return { ok: false, message: "重试仍未成功：" + item.reason };
     }
   }
 
@@ -3903,7 +5760,7 @@ class DiaryAgent {
     if (!ok) return diskFull ? IMAGE_DISK_FULL_REPLY : IMAGE_FAIL_REPLY;
     this._noteWrite(lastN, lastSealed);
     let reply = imageWrittenReply(lastN);
-    if (lastN === 1) reply = FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS;
+    if (lastN === 1) reply = this.writer.firstPrefix(dateStr) + reply + FIRST_OF_DAY_TIPS;
     if (failed) reply = IMAGE_PARTIAL_TEMPLATE.split("{n}").join(String(failed)) + "\n\n" + reply;
     return reply;
   }
@@ -3973,7 +5830,7 @@ class DiaryAgent {
   }
 
   _decorateFirst(reply, n) {
-    return n === 1 ? FIRST_OF_DAY_PREFIX + reply + FIRST_OF_DAY_TIPS : reply;
+    return n === 1 ? this.writer.firstPrefix() + reply + FIRST_OF_DAY_TIPS : reply;
   }
 
   _findKnownMd5(md5) {
@@ -4030,7 +5887,7 @@ class DiaryAgent {
   async _handle(text, isVoice, cross, det) {
     det = det || detectIntent(text);
 
-    if (det.intent === INTENT.HELP) return HELP_TEXT;
+    if (det.intent === INTENT.HELP) return helpText(this.writer._shared(), this.writer._heading(), _dayStartHour);
 
     // 探活(在吗/hello/测试…): 回状态, 不落库。用户在 ping"它还在吗"——尊重这个机制,
     // 别把它记进笔记。bot 不在线时本来就没人回, 有回复即是答案。
@@ -4038,6 +5895,7 @@ class DiaryAgent {
 
     if (det.intent === INTENT.UNDO) {
       const r = await this.writer.undoLastBlock();
+      if (r.foreign) return UNDO_FOREIGN_REPLY; // 独立模式的外来文件护栏(#15 B1): 不是插件建的文件, 不删
       return r.ok ? undoOkReply(r.removed) : UNDO_EMPTY_REPLY;
     }
 
@@ -4083,6 +5941,12 @@ class DiaryAgent {
         this.profile.state = "active";
         return RENAME_CONFIRM_TEMPLATE.split("{name}").join(newName);
       }
+    }
+
+    // 默认只剪藏公众号链接；其它网址保持原句记录，除非用户主动打开扩展开关。
+    if (!det.forced && !isVoice && this.plugin.settings.webClipEnabled !== false) {
+      const links = extractWebUrls(text).filter((url) => shouldClipWebUrl(url, this.plugin.settings));
+      if (links.length) return this._clipLinks(text, links);
     }
 
     // 「记：xx」逃生口: 剥掉前缀, xx 原样落库
@@ -4155,7 +6019,7 @@ class DiaryAgent {
 
     // 跨天告知: 与「今天第一条」语义重复, 只留前者(告知在前, §3.3); 告别语回执不挂——刚道别就说"翻开新的一页"别扭
     if (reply && cross.expiredNotice && !det.signoff) {
-      reply = cross.expiredNotice + "\n\n" + reply.replace(FIRST_OF_DAY_PREFIX, "");
+      reply = cross.expiredNotice + "\n\n" + stripFirstPrefix(reply);
     }
     return reply;
   }
@@ -4418,10 +6282,260 @@ class ClaimOwnerModal extends Modal {
 
 // ── 设置页 ───────────────────────────────────────────────────────────────
 
+// 通用确认框(#15 设置页用): 标题 + 正文 + 确定/取消
+class ConfirmModal extends Modal {
+  constructor(app, title, text, okText, onOk, onCancel) {
+    super(app); this.t = title; this.text = text; this.okText = okText; this.onOk = onOk; this.onCancel = onCancel || null; this._done = false;
+  }
+  onOpen() {
+    this.titleEl.setText(this.t);
+    const pEl = this.contentEl.createEl("p", { text: this.text });
+    if (pEl && pEl.style) pEl.style.whiteSpace = "pre-wrap";
+    const row = new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText(this.okText).setCta().onClick(async () => { this._done = true; this.close(); await this.onOk(); }));
+    if (!this.hideCancel) row.addButton((b) => b.setButtonText("取消").onClick(() => this.close()));
+  }
+  onClose() { this.contentEl.empty(); if (!this._done && this.onCancel) this.onCancel(); }
+}
+
 class WechatDiarySettingTab extends PluginSettingTab {
   constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
 
+  // ── #15 设置页辅助 ──
+  // 外来文件提示(B1): 开关关着、路径却指向不是插件建的文件(多半是用户的每日笔记) → 确认框 + 「改回默认」
+  async _foreignCheck() {
+    const plugin = this.plugin;
+    if (plugin.settings.sharedDailyNote) return;
+    const path = plugin.writer.diaryPath(logicalTodayStr());
+    const f = plugin.app.vault.getFileByPath(path);
+    if (!f) return;
+    let content = "";
+    try { content = await plugin.app.vault.cachedRead(f); } catch (e) { return; }
+    if (!isForeignFile(content)) return;
+    // 文件里有我们的节 = 共用模式自己写的每日笔记, 不是外来文件——不能提供「改回默认」
+    // (谷雨实测: 关开关时点了改回默认, 路径格式被改掉, 之后的文件散在两个层级)
+    const loc = locateSection(content, plugin.writer._heading());
+    if (loc) {
+      const m = new ConfirmModal(this.app, "已关闭「写进已有的每日笔记」",
+        "今天的文件「" + path + "」是共用模式写的每日笔记。关掉后, 微信内容会继续追加到这个文件的末尾(不再归入「" + plugin.writer._heading() + "」一节), 「撤回」「在吗」只认微信记的部分。\n想让内容写回插件自己的文件夹, 改「日记」区的 日记文件夹 / 路径格式。",
+        "知道了", async () => {});
+      m.hideCancel = true;
+      m.open();
+      return;
+    }
+    const before = plugin._beforeImport;
+    const target = before
+      ? { diaryFolder: before.diaryFolder, pathFormat: before.pathFormat }
+      : { diaryFolder: DEFAULT_SETTINGS.diaryFolder, pathFormat: DEFAULT_SETTINGS.pathFormat };
+    const changes = [];
+    if ((plugin.settings.diaryFolder || "日记") !== (target.diaryFolder || "日记")) changes.push("日记文件夹「" + (plugin.settings.diaryFolder || "日记") + "」→「" + (target.diaryFolder || "日记") + "」");
+    if ((plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat) !== (target.pathFormat || DEFAULT_SETTINGS.pathFormat)) changes.push("路径格式「" + (plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」→「" + (target.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」");
+    if (!changes.length) return;
+    new ConfirmModal(this.app, "路径指向的不是插件建的文件",
+      "「" + path + "」不是插件建的(多半是你的每日笔记)。开关关着时插件会往里追加内容, 但只数、只撤微信记的那部分。\n要改回" + (before ? "导入前的路径" : "默认路径") + "吗? 会改: " + changes.join("; "),
+      before ? "改回导入前" : "改回默认",
+      async () => {
+        if (before) { plugin.settings.diaryFolder = before.diaryFolder; plugin.settings.pathFormat = before.pathFormat; plugin.settings.templatePath = before.templatePath; }
+        else { plugin.settings.diaryFolder = DEFAULT_SETTINGS.diaryFolder; plugin.settings.pathFormat = DEFAULT_SETTINGS.pathFormat; }
+        plugin._beforeImport = null;
+        await plugin.persist();
+        this.display();
+      }).open();
+  }
+
+  // 节标题撞用户模板里已有的标题: 今天的文件里该标题下已有内容 → 确认; 取消则回退(onCancel 由调用方给)
+  async _headingCollisionCheck(onCancel) {
+    const plugin = this.plugin;
+    if (!plugin.settings.sharedDailyNote) return;
+    const w = plugin.writer;
+    const f = plugin.app.vault.getFileByPath(w.diaryPath(logicalTodayStr()));
+    if (!f) return;
+    let content = "";
+    try { content = await plugin.app.vault.cachedRead(f); } catch (e) { return; }
+    const heading = w._heading();
+    const loc = locateSection(content, heading);
+    if (!loc || !trimBody(normalizeNewlines(content.slice(loc.bodyStart, loc.bodyEnd))).trim()) return;
+    new ConfirmModal(this.app, "这个标题下面已经有内容",
+      "今天的每日笔记里「" + heading + "」下面已经有内容。插件会把它当成自己的一节: 计入段数, 「撤回」会删到它。\n确定用这个标题吗?",
+      "确定", async () => {}, onCancel).open();
+  }
+
+  // 读每日笔记的设置: Periodic Notes(daily) 优先, 否则核心「每日笔记」。返回 { src: {folder,format,template}, name } 或 null
+  _readDailyNotesSettings() {
+    const app = this.app;
+    try {
+      const pn = app.plugins && app.plugins.getPlugin ? app.plugins.getPlugin("periodic-notes") : null;
+      if (pn && pn.settings && pn.settings.daily && pn.settings.daily.enabled !== false) return { src: pn.settings.daily, name: "Periodic Notes" };
+      const dn = app.internalPlugins && app.internalPlugins.getPluginById ? app.internalPlugins.getPluginById("daily-notes") : null;
+      if (dn && dn.enabled && dn.instance && dn.instance.options) return { src: dn.instance.options, name: "每日笔记" };
+    } catch (e) { /* 读不到按没有算 */ }
+    return null;
+  }
+
+  // 打开开关时自动对齐(谷雨 8/31 拍板做法一): 每日笔记的位置/格式与插件设置不一致 → 直接弹导入确认;
+  // 读不到设置 → 提示自己选。不静默改任何值。
+  async _suggestImportOnEnable() {
+    const plugin = this.plugin;
+    const found = this._readDailyNotesSettings();
+    if (!found) {
+      new Notice("没找到每日笔记插件的设置(核心「每日笔记」或 Periodic Notes 都没启用)。请在「日记」区选好你每日笔记的文件夹和路径格式, 否则微信内容会写到「" + (plugin.settings.diaryFolder || "日记") + "」下、和你的每日笔记不在一起", 12000);
+      return;
+    }
+    const dnFolder = String(found.src.folder || "").trim() || "/";
+    const dnFormat = String(found.src.format || "").trim() || "YYYY-MM-DD";
+    const curFolder = String(plugin.settings.diaryFolder || "日记");
+    const curFormat = plugin.settings.pathFormat || DEFAULT_SETTINGS.pathFormat;
+    const same = normalizePath(dnFolder === "/" ? "/" : dnFolder) === normalizePath(curFolder === "/" ? "/" : curFolder) && dnFormat === curFormat;
+    if (same) return;
+    this._importDailyNotes(); // 已自带差异清单 + 确认框
+  }
+
+  // 从每日笔记设置导入: 一键覆盖三项, 先确认
+  _importDailyNotes() {
+    const plugin = this.plugin;
+    const app = this.app;
+    const found = this._readDailyNotesSettings();
+    const src = found && found.src, name = found && found.name;
+    if (!src) { new Notice("没找到启用的每日笔记设置(核心「每日笔记」或 Periodic Notes 的 daily), 请在上面自己选日记文件夹 / 路径格式 / 模板"); return; }
+    const folder = String(src.folder || "").trim() || "/";
+    const format = String(src.format || "").trim() || "YYYY-MM-DD";
+    const tplRaw = String(src.template || "").trim();
+    let tplPath = "";
+    if (tplRaw) {
+      const mc = app.metadataCache;
+      const f = mc && typeof mc.getFirstLinkpathDest === "function" ? mc.getFirstLinkpathDest(normalizePath(tplRaw), "") : null;
+      if (f && f.path) tplPath = f.path;
+      else if (app.vault.getFileByPath(normalizePath(tplRaw + ".md"))) tplPath = normalizePath(tplRaw + ".md");
+      else if (app.vault.getFileByPath(normalizePath(tplRaw))) tplPath = normalizePath(tplRaw);
+    }
+    const v = validatePathFormat(format, { requireDaily: true, momentLib: moment });
+    const cur = plugin.settings;
+    const text = "将把下面三项覆盖为" + name + "的设置:\n" +
+      "· 日记文件夹: " + folder + (folder === "/" ? " (库根目录)" : "") + "\n" +
+      "· 路径格式: " + format + (v.ok ? "" : " (⚠️ " + v.error + ", 这项不会导入)") + "\n" +
+      "· 模板: " + (tplPath || (tplRaw ? "没找到「" + tplRaw + "」, 请自己选" : "无")) + "\n\n" +
+      "当前值: 日记文件夹「" + (cur.diaryFolder || "日记") + "」, 路径格式「" + (cur.pathFormat || DEFAULT_SETTINGS.pathFormat) + "」, 模板「" + (cur.templatePath || "无") + "」";
+    new ConfirmModal(this.app, "从" + name + "设置导入", text, "导入", async () => {
+      plugin._beforeImport = { diaryFolder: cur.diaryFolder, pathFormat: cur.pathFormat, templatePath: cur.templatePath };
+      cur.diaryFolder = folder;
+      if (v.ok) cur.pathFormat = v.value; else new Notice("路径格式没导入: " + v.error);
+      cur.templatePath = tplPath;
+      if (tplRaw && !tplPath) new Notice("模板文件没找到, 请自己选");
+      await plugin.persist();
+      this.display();
+    }).open();
+  }
+
+  // 选文件夹/文件(谷雨 8/30 终审: 不让用户填, 也不要级联下拉): 一个输入框, 点进去就弹出整棵树(按层级缩进),
+  // 打字过滤, 点一项才选定; 手打一个不存在的路径在离开输入框时回退并提示"先在文件列表里建好"。
+  // 与 Obsidian 核心「附件默认存放路径」「每日笔记 → 新建文件位置」同一种交互。
+  _pathSuggest(t, opts) {
+    const app = this.app;
+    const kind = opts.kind || "folder";
+    let saved = opts.value || "";
+    let typed = false;
+    const isFolder = (c) => c && Array.isArray(c.children);
+    const allItems = () => {
+      let list = [];
+      try {
+        if (kind === "folder") {
+          const folders = typeof app.vault.getAllFolders === "function"
+            ? app.vault.getAllFolders()
+            : app.vault.getAllLoadedFiles().filter(isFolder);
+          list = folders.map((f) => f.path).filter((x) => x && x !== "/");
+        } else {
+          list = (typeof app.vault.getMarkdownFiles === "function" ? app.vault.getMarkdownFiles() : []).map((f) => f.path);
+        }
+      } catch (e) { list = []; }
+      list.sort((a, b) => a.localeCompare(b));
+      if (kind === "folder" && opts.allowRoot) list.unshift("/");
+      return list;
+    };
+    const commit = async (v) => {
+      if (v === saved) return;
+      saved = v;
+      t.setValue(v);
+      await opts.onPick(v);
+    };
+    t.setValue(saved);
+    t.inputEl.addEventListener("input", () => { typed = true; });
+    if (typeof AbstractInputSuggest === "function") {
+      const sug = new (class extends AbstractInputSuggest {
+        getSuggestions(query) {
+          const all = allItems();
+          const q = (query || "").trim().toLowerCase();
+          // 刚点进来(没打字)或框里就是当前值: 列整棵树, 让人用眼睛找、用鼠标点
+          if (!typed || !q || q === String(saved).toLowerCase()) return all.slice(0, 300);
+          return all.filter((x) => x.toLowerCase().includes(q)).slice(0, 300);
+        }
+        renderSuggestion(item, el) {
+          if (item === "/") { el.setText("库根目录 /"); return; }
+          const depth = item.split("/").length - 1;
+          const name = item.split("/").pop();
+          el.setText((kind === "folder" ? "📁 " : "📄 ") + name);
+          if (el.style) el.style.paddingLeft = (12 + depth * 16) + "px";
+          if (depth > 0 && el.setAttr) el.setAttr("title", item);
+        }
+        selectSuggestion(item) { typed = false; this.close(); commit(item); }
+      })(app, t.inputEl);
+      t.inputEl.addEventListener("focus", () => { typed = false; try { sug.open(); } catch (e) { /* 老版本没有 open, 打一个字也会弹 */ } });
+    }
+    // 离开输入框: 手打的路径必须是库里已有的(或 "/"), 否则回退
+    t.inputEl.addEventListener("blur", () => {
+      window.setTimeout(async () => {
+        const v = (t.getValue() || "").trim();
+        if (!v) { t.setValue(saved); return; }
+        if (v === saved) return;
+        const ok = (kind === "folder" && opts.allowRoot && v === "/") || allItems().includes(normalizePath(v));
+        if (ok) await commit(v === "/" ? "/" : normalizePath(v));
+        else { t.setValue(saved); new Notice(kind === "folder" ? "库里没有这个文件夹, 先在 Obsidian 文件列表里建好再来选" : "库里没有这个文件, 请从列表里选"); }
+      }, 150); // 让点选列表项的 selectSuggestion 先跑
+    });
+  }
+
+  // 输入框下方的实时预览行(B3): 合法显示"今天会写到: …", 不合法变红写原因; 不弹 Notice
+  _previewLine(setting, render) {
+    const host = setting.descEl || setting.settingEl || setting.controlEl;
+    const el = host && host.createDiv ? host.createDiv({ cls: "wd-path-preview" }) : null;
+    const update = () => {
+      if (!el) return;
+      const r = render();
+      el.setText(r.text);
+      if (el.toggleClass) el.toggleClass("wd-path-preview-bad", !r.ok);
+    };
+    update();
+    return update;
+  }
+
+  // 去抖定时器统一登记: 重绘(display)前先把没到点的提交一次, 免得"页面显示旧值、data.json 已是新值"
+  _later(fn, ms) {
+    if (!this._timers) this._timers = new Map();
+    const id = window.setTimeout(async () => { this._timers.delete(id); try { await fn(); } catch (e) { console.error("[wechat-diary] 设置页提交失败:", e && e.message); } }, ms);
+    this._timers.set(id, fn);
+    return id;
+  }
+  _clearLater(id) { if (this._timers && this._timers.has(id)) { window.clearTimeout(id); this._timers.delete(id); } }
+  async _flushLater() {
+    if (!this._timers || !this._timers.size) return;
+    const fns = [...this._timers.values()];
+    for (const id of this._timers.keys()) window.clearTimeout(id);
+    this._timers.clear();
+    for (const fn of fns) { try { await fn(); } catch (e) { console.error("[wechat-diary] 设置页提交失败:", e && e.message); } }
+  }
+
+  // 改下拉/开关会整页重建, 不保滚动位置就跳回顶部(issue #1 Roy 反馈, 2026-09-01 修):
+  // 重建前记下 scrollTop, 重建后立即恢复, 再补一帧(有些主题下高度在下一帧才稳定)
   display() {
+    const { containerEl } = this;
+    if (this._timers && this._timers.size) { this._flushLater().then(() => this.display()); return; }
+    const keepScroll = containerEl.scrollTop || 0;
+    this._render();
+    if (keepScroll) {
+      containerEl.scrollTop = keepScroll;
+      if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => { containerEl.scrollTop = keepScroll; });
+    }
+  }
+  _render() {
     const { containerEl } = this;
     containerEl.empty();
     const plugin = this.plugin;
@@ -4451,37 +6565,137 @@ class WechatDiarySettingTab extends PluginSettingTab {
         if (state === "none") b.setDisabled(true);
       });
 
-    // 日记文件夹: 输入即搜索(同核心设置"附件默认存放路径"的交互)——
-    // 打字过滤全库任意深度的文件夹, 点选即填; 输入不存在的路径会在写入时自动创建
-    const curFolder = plugin.settings.diaryFolder || "日记";
-    const appRef = this.app;
+    // ── 日记 ──────────────────────────────────────────────────────────────
+    new Setting(containerEl).setName("日记").setHeading();
+    const st = plugin.settings;
+    const todayD = logicalTodayStr();
+    let fmtPreview = null; // 路径格式的预览行(下面声明); 改日记文件夹时也要刷新它
+
     new Setting(containerEl)
       .setName("日记文件夹")
-      .setDesc("按 年/日期.md 存放 (与 Python 版数据契约一致)。打几个字搜索库里的文件夹(含子文件夹)直接选; 输入新路径会自动创建")
+      .setDesc("日记的根目录。点进去选一个库里的文件夹(打字可以过滤)。文件放在根目录下的哪里由下面的「日记文件路径格式」决定。要用新文件夹, 先在 Obsidian 文件列表里建好再来选。")
+      .addText((t) => this._pathSuggest(t, {
+        kind: "folder", allowRoot: true, value: st.diaryFolder || "日记",
+        onPick: async (v) => { st.diaryFolder = v || "日记"; await plugin.persist(); if (fmtPreview) fmtPreview(); await this._foreignCheck(); },
+      }));
+
+    // 路径格式: 三个预设 + 自定义(选了自定义才露出输入框)
+    const PRESETS = {
+      "YYYY/YYYY-MM-DD": "按年分文件夹 (2026/2026-08-30.md)",
+      "YYYY/MM/YYYY-MM-DD": "按年/月分文件夹 (2026/08/2026-08-30.md)",
+      "YYYY-MM-DD": "不分文件夹 (2026-08-30.md)",
+    };
+    const curFmt = st.pathFormat || DEFAULT_SETTINGS.pathFormat;
+    const fmtIsPreset = Object.prototype.hasOwnProperty.call(PRESETS, curFmt);
+    let fmtDraft = curFmt;
+    let fmtTimer = null;
+    const fmtSetting = new Setting(containerEl)
+      .setName("日记文件路径格式")
+      .setDesc("改了之后已有文件不搬, 只影响之后新建的。");
+    fmtPreview = this._previewLine(fmtSetting, () => {
+      const v = validatePathFormat(fmtDraft, { requireDaily: true, momentLib: moment });
+      if (!v.ok) return { ok: false, text: v.error + " (没有保存)" };
+      return { ok: true, text: "今天会写到: " + plugin.writer._join(plugin.writer._root(), renderPath(v.value, todayD, moment) + ".md") };
+    });
+    fmtSetting.addDropdown((d) => {
+      const opts = Object.assign({}, PRESETS, { custom: "自定义…" });
+      d.addOptions(opts).setValue(fmtIsPreset ? curFmt : "custom")
+        .onChange(async (v) => {
+          if (v === "custom") { st._fmtCustom = true; this.display(); return; }
+          st._fmtCustom = false;
+          if (v !== st.pathFormat) { st.pathFormat = v; await plugin.persist(); await this._foreignCheck(); }
+          fmtDraft = v;
+          this.display();
+        });
+    });
+    if (!fmtIsPreset || st._fmtCustom) {
+      const customSetting = new Setting(containerEl)
+        .setName("自定义路径格式")
+        .setDesc("相对日记文件夹; 与 Obsidian 每日笔记「日期格式」同一套写法(moment)。英文字母会被当成日期代码, 固定的文件夹名要放在方括号里, 如 [daily]/YYYY/MM/YYYY-MM-DD。");
+      customSetting.addText((t) => t.setPlaceholder(DEFAULT_SETTINGS.pathFormat).setValue(fmtIsPreset ? "" : curFmt)
+        .onChange((v) => {
+          fmtDraft = (v || "").trim() || DEFAULT_SETTINGS.pathFormat;
+          this._clearLater(fmtTimer);
+          fmtTimer = this._later(async () => {
+            const r = validatePathFormat(fmtDraft, { requireDaily: true, momentLib: moment });
+            if (r.ok && r.value !== st.pathFormat) { st.pathFormat = r.value; await plugin.persist(); await this._foreignCheck(); }
+            fmtPreview();
+          }, 400);
+        }));
+    }
+
+    new Setting(containerEl).setName("链接剪藏").setHeading();
+    new Setting(containerEl)
+      .setName("自动提取公众号正文")
+      .setDesc("微信里发 mp.weixin.qq.com 公众号链接时，抓取标题、正文和正文图片保存为 Markdown；今日日记保留原句并另起一行放剪藏入口。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipEnabled !== false)
+        .onChange(async (v) => { plugin.settings.webClipEnabled = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("后台提取，不阻塞微信记录")
+      .setDesc("默认开启。先把原链接写进日记并立即回复，再排队抓正文和图片；完成后另发一条结果通知。关闭后恢复为抓完再回复。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipBackground !== false)
+        .onChange(async (v) => { plugin.settings.webClipBackground = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("其他网站的链接也提取正文")
+      .setDesc("默认关闭。关闭时普通网址只按原句记进日记，不访问网页；开启后才尝试剪藏其它公开网站。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipOtherSites === true)
+        .onChange(async (v) => { plugin.settings.webClipOtherSites = v; await plugin.persist(); }));
+    const defaultClipFolder = defaultWebClipFolder(plugin.settings);
+    new Setting(containerEl)
+      .setName("剪藏文件夹")
+      .setDesc("默认跟随日记文件夹，放在 <日记文件夹>/剪藏；留空即可恢复跟随")
+      .addText((t) => t.setPlaceholder(defaultClipFolder).setValue(plugin.settings.webClipFolder || defaultClipFolder)
+        .onChange(async (v) => { plugin.settings.webClipFolder = (v || "").trim(); await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("保存正文图片")
+      .setDesc("下载正文区域内的图片到剪藏文件夹 assets 目录，并在 Markdown 中使用本地 Obsidian 图片内链。单张图片上限 15MB。")
+      .addToggle((t) => t.setValue(plugin.settings.webClipSaveImages !== false)
+        .onChange(async (v) => { plugin.settings.webClipSaveImages = v; await plugin.persist(); }));
+    new Setting(containerEl)
+      .setName("每篇最多图片数")
+      .setDesc("范围 1–100，默认 30；超出的图片会保留原图链接和失败原因")
       .addText((t) => {
-        t.setPlaceholder("日记").setValue(curFolder)
-          .onChange(async (v) => { plugin.settings.diaryFolder = (v || "").trim() || "日记"; await plugin.persist(); });
-        if (typeof AbstractInputSuggest === "function") {
-          new (class extends AbstractInputSuggest {
-            getSuggestions(query) {
-              const q = (query || "").toLowerCase();
-              const folders = typeof appRef.vault.getAllFolders === "function"
-                ? appRef.vault.getAllFolders()
-                : appRef.vault.getAllLoadedFiles().filter((f) => Array.isArray(f.children));
-              return folders
-                .filter((f) => f.path && f.path !== "/" && f.path.toLowerCase().includes(q))
-                .slice(0, 80);
-            }
-            renderSuggestion(folder, el) { el.setText(folder.path); }
-            selectSuggestion(folder) {
-              t.setValue(folder.path);
-              plugin.settings.diaryFolder = folder.path;
-              plugin.persist();
-              this.close();
-            }
-          })(appRef, t.inputEl);
-        }
+        t.inputEl.type = "number";
+        t.inputEl.min = "1";
+        t.inputEl.max = String(WEB_CLIP_HARD_MAX_IMAGES);
+        t.setValue(String(webClipMaxImages(plugin.settings))).onChange(async (v) => {
+          const n = Math.floor(Number(v));
+          if (!Number.isFinite(n) || n < 1 || n > WEB_CLIP_HARD_MAX_IMAGES) return;
+          plugin.settings.webClipMaxImages = n;
+          await plugin.persist();
+        });
       });
+    new Setting(containerEl)
+      .setName("每篇图片总量上限（MB）")
+      .setDesc("范围 15–500，默认 50；包含大量动图的文章会占用更多 Vault 空间")
+      .addText((t) => {
+        t.inputEl.type = "number";
+        t.inputEl.min = String(WEB_CLIP_MIN_TOTAL_IMAGE_MB);
+        t.inputEl.max = String(WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB);
+        t.setValue(String(Math.floor(webClipMaxTotalImageBytes(plugin.settings) / 1024 / 1024))).onChange(async (v) => {
+          const n = Math.floor(Number(v));
+          if (!Number.isFinite(n) || n < WEB_CLIP_MIN_TOTAL_IMAGE_MB || n > WEB_CLIP_HARD_MAX_TOTAL_IMAGE_MB) return;
+          plugin.settings.webClipMaxTotalImageMb = n;
+          await plugin.persist();
+        });
+      });
+    const clipFailures = Array.isArray(plugin.data.webClipFailures) ? plugin.data.webClipFailures : [];
+    const lastClipFailure = clipFailures.length ? clipFailures[clipFailures.length - 1] : null;
+    new Setting(containerEl)
+      .setName("失败剪藏队列")
+      .setDesc(lastClipFailure
+        ? "待重试 " + clipFailures.length + " 条；最近失败：" + lastClipFailure.reason
+        : "没有待重试的网页剪藏。失败时原始链接仍会先保存在日记中。")
+      .addButton((b) => b.setButtonText("重试最近一条").setDisabled(!lastClipFailure).onClick(async () => {
+        const result = await plugin.agent.retryLastWebClipFailure();
+        new Notice(result.message);
+        this.display();
+      }))
+      .addButton((b) => b.setButtonText("清空失败记录").setDisabled(!clipFailures.length).onClick(async () => {
+        plugin.data.webClipFailures = [];
+        await plugin.persist();
+        this.display();
+      }));
 
     // 时区: 引擎支持就给完整 IANA 下拉, 不支持退回文本框
     const curTz = plugin.settings.timezone || "Asia/Shanghai";
@@ -4509,6 +6723,117 @@ class WechatDiarySettingTab extends PluginSettingTab {
         }));
     }
 
+    // ── 写进已有的每日笔记 ────────────────────────────────────────────────
+    new Setting(containerEl).setName("写进已有的每日笔记").setHeading();
+    const headingNow = st.sectionHeading || DEFAULT_SETTINGS.sectionHeading;
+    new Setting(containerEl)
+      .setName("写进已有的每日笔记")
+      .setDesc("开启后不再单独建文件: 微信内容写进当天每日笔记末尾的「## " + headingNow + "」一节, 撤回和段数只看这一节。打开时会读取每日笔记插件的位置并请你确认对齐; 之后你改了每日笔记插件的设置, 这里不会自动跟着变(看下面的预览行)。关着时一切与以前相同。")
+      .addToggle((t) => t.setValue(!!st.sharedDailyNote)
+        .onChange(async (v) => {
+          st.sharedDailyNote = v;
+          await plugin.persist();
+          if (v) {
+            await this._suggestImportOnEnable(); // 位置/格式和每日笔记插件不一致 → 弹导入确认(做法一, 8/31)
+            await this._headingCollisionCheck(async () => { st.sharedDailyNote = false; await plugin.persist(); this.display(); });
+          } else await this._foreignCheck();
+          this.display();
+        }));
+    if (st.sharedDailyNote) {
+      let headingTimer = null;
+      new Setting(containerEl)
+        .setName("节标题")
+        .setDesc("级别固定二级(## 标题)。这一节归插件: 节下面写任何标题就算节结束; 节里手写的内容会被当成插件的; 别用你每日笔记里已有的标题。改标题只影响之后, 已写的留在旧标题下。想固定这一节的位置, 把「## " + headingNow + "」写进你的每日笔记模板, 标题下面留空。当天切换开关, 今天已记的段落不跟着走。")
+        .addText((t) => t.setPlaceholder(DEFAULT_SETTINGS.sectionHeading).setValue(headingNow)
+          .onChange((v) => {
+            this._clearLater(headingTimer);
+            headingTimer = this._later(async () => {
+              const r = normalizeHeading(v);
+              if (!r.value) return; // 空/半截: 不落盘
+              if (r.error) { new Notice(r.error); return; }
+              if (r.stripped) { new Notice("节标题固定二级, 已去掉 #"); t.setValue(r.value); }
+              if (r.value === st.sectionHeading) return;
+              const old = st.sectionHeading;
+              st.sectionHeading = r.value;
+              await plugin.persist();
+              await this._headingCollisionCheck(async () => { st.sectionHeading = old; await plugin.persist(); this.display(); });
+            }, 500);
+          }));
+      const tplSetting = new Setting(containerEl)
+        .setName("新建文件时用的模板")
+        .setDesc("当天的每日笔记还不存在时(微信先到), 按这个模板建文件再写入我们那一节——否则每日笔记插件之后打开就不套模板了。支持 {{title}} {{date}} {{time}} 和 {{date:YYYY-MM-DD}}; Templater 脚本模板不处理。不选 = 只建我们那一节。模板里「## " + headingNow + "」下面的文字会被第一条消息替换。");
+      if (plugin._templateMissing && tplSetting.descEl && tplSetting.descEl.createSpan) {
+        tplSetting.descEl.createSpan({ cls: "wd-path-preview-bad", text: " ⚠️ 上次建文件时没读到模板文件: " + plugin._templateMissing });
+      }
+      tplSetting.addText((t) => this._pathSuggest(t, {
+        kind: "file", value: st.templatePath || "",
+        onPick: async (v) => { st.templatePath = v || ""; plugin._templateMissing = ""; await plugin.persist(); },
+      }));
+      new Setting(containerEl)
+        .setName("从每日笔记设置导入")
+        .setDesc("读取 Obsidian「每日笔记」(或 Periodic Notes)的文件夹、日期格式、模板, 填进日记文件夹 / 路径格式 / 模板三项。会先让你确认。")
+        .addButton((b) => b.setButtonText("导入").onClick(() => this._importDailyNotes()));
+      const dsh = Number(st.dayStartHour);
+      const dshVal = Number.isInteger(dsh) && dsh >= 0 && dsh <= 12 ? dsh : 4;
+      const hourOpts = {};
+      for (let h = 0; h <= 12; h++) hourOpts[String(h)] = h === 0 ? "0 点(和每日笔记一样, 零点算新的一天)" : h + " 点";
+      new Setting(containerEl)
+        .setName("一天从几点开始")
+        .setDesc("插件默认凌晨 4 点才算新的一天(夜猫子睡前记的算前一晚); 每日笔记插件是零点。想和每日笔记一致就选 0。每日提醒的最晚时间也跟着变。")
+        .addDropdown((d) => d.addOptions(hourOpts).setValue(String(dshVal))
+          .onChange(async (v) => { st.dayStartHour = Number(v); setDayStartHour(st.dayStartHour); await plugin.persist(); this.display(); }));
+    }
+
+    // ── 附件 ──────────────────────────────────────────────────────────────
+    new Setting(containerEl).setName("附件").setHeading();
+    const attMode = st.attachmentMode || "diary";
+    const ATT_DESC = {
+      diary: "存在日记文件夹内的 attachments/年 下(默认)。",
+      obsidian: "按 Obsidian「文件与链接 → 附件默认存放路径」放。",
+      custom: "存到下面选的文件夹。",
+    };
+    new Setting(containerEl)
+      .setName("附件位置")
+      .setDesc("图片、文件、视频、语音原声存在哪。" + ATT_DESC[attMode] + " 语音气泡只认文件名, 与位置无关。")
+      .addDropdown((d) => d.addOptions({ diary: "日记文件夹内 (attachments/年)", obsidian: "跟随 Obsidian 的附件设置", custom: "自定义文件夹" })
+        .setValue(attMode)
+        .onChange(async (v) => { st.attachmentMode = v; await plugin.persist(); this.display(); }));
+    if (attMode === "custom") {
+      let attPreview = null;
+      new Setting(containerEl)
+        .setName("自定义附件文件夹")
+        .setDesc("点进去选一个库里的文件夹(打字可以过滤)。要用新文件夹, 先在 Obsidian 文件列表里建好再来选。")
+        .addText((t) => this._pathSuggest(t, {
+          kind: "folder", allowRoot: true, value: st.attachmentFolder || "",
+          onPick: async (v) => { st.attachmentFolder = v || ""; await plugin.persist(); if (attPreview) attPreview(); },
+        }));
+      const subSetting = new Setting(containerEl)
+        .setName("按日期分子文件夹(可空)")
+        .setDesc("在上面的文件夹下再按日期分层, 用日期代码写, 如 YYYY 或 YYYY/MM。留空就直接放在那个文件夹里。");
+      let subDraft = st.attachmentSubFormat || "";
+      let subTimer = null;
+      attPreview = this._previewLine(subSetting, () => {
+        const folder = String(st.attachmentFolder || "").trim();
+        if (!folder && !subDraft.trim()) return { ok: true, text: "还没选: 先按默认位置(日记文件夹内的 attachments/年)存" };
+        const v = subDraft.trim() ? validatePathFormat(subDraft, { requireDaily: false, momentLib: moment }) : { ok: true, value: "" };
+        if (!v.ok) return { ok: false, text: v.error + " (没有保存)" };
+        const base = folder === "/" ? "" : folder;
+        const rel = v.value ? renderPath(v.value, todayD, moment) : "";
+        return { ok: true, text: "附件会存到: " + (plugin.writer._join(base, rel) || "库根目录") + "/" };
+      });
+      subSetting.addText((t) => t.setPlaceholder("YYYY/MM").setValue(subDraft)
+        .onChange((v) => {
+          subDraft = v || "";
+          this._clearLater(subTimer);
+          subTimer = this._later(async () => {
+            if (!subDraft.trim()) { if (st.attachmentSubFormat) { st.attachmentSubFormat = ""; await plugin.persist(); } attPreview(); return; }
+            const r = validatePathFormat(subDraft, { requireDaily: false, momentLib: moment });
+            if (r.ok && r.value !== st.attachmentSubFormat) { st.attachmentSubFormat = r.value; await plugin.persist(); }
+            attPreview();
+          }, 400);
+        }));
+    }
+
     new Setting(containerEl).setName("语音").setHeading();
     new Setting(containerEl)
       .setName("保存语音原声")
@@ -4524,7 +6849,12 @@ class WechatDiarySettingTab extends PluginSettingTab {
         .onChange(async (v) => { plugin.settings.reminderEnabled = v; await plugin.persist(); }));
     new Setting(containerEl)
       .setName("提醒时间")
-      .setDesc("24 小时制, 如 21:30。凌晨 4 点前都算前一天, 所以提醒最晚可设到 03:59")
+      .setDesc((() => {
+        const h = Number(plugin.settings.dayStartHour);
+        const dsh = Number.isInteger(h) && h >= 0 && h <= 12 ? h : 4;
+        if (dsh === 0) return "24 小时制, 如 21:30。一天从零点开始, 所以提醒最晚可设到 23:59";
+        return "24 小时制, 如 21:30。凌晨 " + dsh + " 点前都算前一天, 所以提醒最晚可设到 " + String(dsh - 1).padStart(2, "0") + ":59";
+      })())
       .addText((t) => {
         let lastValid = plugin.settings.reminderTime || "21:30";
         t.setPlaceholder("21:30").setValue(lastValid)
@@ -4542,6 +6872,20 @@ class WechatDiarySettingTab extends PluginSettingTab {
             // 打到一半的中间态("21:"): 什么都不做, 存储保持上一个合法值
           });
       });
+
+    new Setting(containerEl).setName("兼容性诊断").setHeading();
+    const unknownHistory = Array.isArray(plugin.data.unknownMessages) ? plugin.data.unknownMessages : [];
+    const lastUnknown = unknownHistory.length ? unknownHistory[unknownHistory.length - 1] : null;
+    new Setting(containerEl)
+      .setName("暂不支持的微信消息")
+      .setDesc(lastUnknown
+        ? "最近一次：" + lastUnknown.at + "；item 类型：" + lastUnknown.itemTypes.join(", ") + "。这里只保存类型与字段名，不保存正文、链接、token 或媒体密钥。"
+        : "尚未检测到暂不支持的消息。公众号卡片、合并聊天记录等能否送达取决于腾讯通道。")
+      .addButton((b) => b.setButtonText("清除诊断记录").setDisabled(!unknownHistory.length).onClick(async () => {
+        plugin.data.unknownMessages = [];
+        await plugin.persist();
+        this.display();
+      }));
 
     new Setting(containerEl).setName("AI (暂未启用)").setHeading();
     containerEl.createEl("p", {
@@ -4577,6 +6921,12 @@ class WechatDiarySettingTab extends PluginSettingTab {
 
 const DEFAULT_DATA = () => ({
   settings: Object.assign({}, DEFAULT_SETTINGS),
+  // 最近剪藏 URL → vault 路径, 用于重复链接复用；文件名 hash 扫描是 data.json 丢失后的第二道兜底。
+  webClips: [],
+  // 抓取失败的网页剪藏，供命令面板手动重试；原始消息已经写入日记，不会因队列丢失。
+  webClipFailures: [],
+  // 最近 20 条未知 item 的脱敏结构摘要；只用于兼容新微信消息类型，不保存消息正文或协议密钥。
+  unknownMessages: [],
   ilink: {
     botId: "", userId: "", baseUrl: "", buf: "",
     contextTokens: {}, recentSeqs: [], pauseUntil: 0, lastAliveTs: 0, loginTime: "",
@@ -4597,9 +6947,13 @@ const DEFAULT_DATA = () => ({
 class WechatDiaryPlugin extends Plugin {
   async onload() {
     const stored = (await this.loadData()) || {};
+    const storedSettings = stored.settings && typeof stored.settings === "object" ? stored.settings : {};
     const base = DEFAULT_DATA();
     this.data = {
-      settings: Object.assign(base.settings, stored.settings),
+      settings: Object.assign(base.settings, storedSettings),
+      webClips: Array.isArray(stored.webClips) ? stored.webClips : base.webClips,
+      webClipFailures: Array.isArray(stored.webClipFailures) ? stored.webClipFailures.slice(-50) : base.webClipFailures,
+      unknownMessages: Array.isArray(stored.unknownMessages) ? stored.unknownMessages.slice(-UNKNOWN_MESSAGE_HISTORY_LIMIT) : base.unknownMessages,
       ilink: Object.assign(base.ilink, stored.ilink),
       profile: Object.assign(base.profile, stored.profile),
       session: Object.assign(base.session, stored.session),
@@ -4630,6 +6984,7 @@ class WechatDiaryPlugin extends Plugin {
 
     this.ai = new AiClient(this);
     this.writer = new DiaryWriter(this, this.ai);
+    this.clipper = new WebClipper(this);
     this.chatHandler = new ChatHandler(this.ai);
     this.agent = new DiaryAgent(this);
 
@@ -4656,9 +7011,23 @@ class WechatDiaryPlugin extends Plugin {
     this.addCommand({
       id: "open-today-note",
       name: "打开今天的日记",
-      callback: () => {
-        const path = this.writer.diaryPath(logicalTodayStr());
+      callback: async () => {
+        const day = logicalTodayStr();
+        const path = this.writer.diaryPath(day);
+        // 共用模式(#15): 文件不存在先按用户模板建, 否则 Obsidian 会新建空文件, 每日笔记插件之后就不套模板了
+        if (this.settings.sharedDailyNote && !this.app.vault.getFileByPath(path)) {
+          try { await this.writer._createDayFile(day, ""); } catch (e) { console.error("[wechat-diary] 建今天的每日笔记失败:", e && e.message); }
+        }
         this.app.workspace.openLinkText(path, "", false);
+      },
+    });
+    this.addCommand({
+      id: "retry-last-web-clip",
+      name: "重试最近失败的网页剪藏",
+      callback: async () => {
+        const result = await this.agent.retryLastWebClipFailure();
+        new Notice(result.message);
+        if (result.ok && result.path) this.app.workspace.openLinkText(result.path, "", false);
       },
     });
 
@@ -4924,7 +7293,8 @@ class WechatDiaryPlugin extends Plugin {
       const src = (el.getAttribute("src") || "").split("#")[0].split("|")[0].trim();
       // 只认本插件的完整命名(attachments/年/日期-时间-语音[-重试后缀].wav)——
       // 用户自己名字带"语音"的 wav 一概不碰(审稿轮抓出「英语语音作业.wav」误伤)
-      if (!/attachments\/\d{4}\/\d{4}-\d{2}-\d{2}-\d{4}-语音(?:-[0-9a-f]{4})*\.wav$/.test(src)) return;
+      // 只看文件名不看目录(#15: 附件位置可配置后目录不固定); 兼容 Obsidian 撞名后缀「语音 1.wav」
+      if (!/(^|\/)\d{4}-\d{2}-\d{2}-\d{4}-语音(?:-[0-9a-f]{4}| \d+)*\.wav$/.test(src)) return;
       if (el.dataset.wdVoice) return;
       const file = this.app.metadataCache.getFirstLinkpathDest(src, "");
       if (!file) return; // 先别打标: metadataCache 未就绪时留给下一轮重试(审稿轮抓出)
@@ -4984,6 +7354,29 @@ class WechatDiaryPlugin extends Plugin {
     if (!b) return;
     b.classList.toggle("wd-playing", playing);
     b.setAttribute("aria-label", playing ? "暂停语音" : (b.dataset.wdBaseLabel || "播放语音"));
+  }
+
+  enqueueWebClipJob(task) {
+    const run = async () => {
+      // 让当前入站消息先完成 persist 与微信回执，再开始耗时网络抓取。
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+      if (this._unloaded) return;
+      let result = "";
+      try {
+        result = await task();
+        await this.persist();
+      } catch (e) {
+        result = "网页剪藏后台任务失败：" + String((e && e.message) || e || "未知错误");
+        console.error("[wechat-diary] 网页剪藏后台任务失败:", e);
+      }
+      const il = this.data.ilink;
+      if (!result || this._unloaded || !this._client || !il.userId || this._isPaused()) return;
+      try { await this._client.sendText(il.userId, result, il.contextTokens[il.userId]); }
+      catch (e) { console.error("[wechat-diary] 网页剪藏结果通知失败:", e && e.message); }
+    };
+    // 串行化，避免多篇文章同时下载把 Vault 和网络占满；前一项失败不截断后续队列。
+    this._webClipQueue = (this._webClipQueue || Promise.resolve()).then(run, run);
+    return this._webClipQueue;
   }
 
   // 每日提醒(D10)。发送前提: 管道活着且最近一轮拉取已完成(_pollSettledTs 新鲜)——
@@ -5123,7 +7516,20 @@ class WechatDiaryPlugin extends Plugin {
       for (const msg of msgs) {
         if (dead()) { batchDone = false; break; }
         try { await this._handleIncoming(msg); }
-        catch (e) { console.error("[wechat-diary] 处理消息失败:", e); }
+        catch (e) {
+          // 单条失败不能推进整批游标。_handleIncoming 在处理前登记 seq，期间某些分支
+          // 还会 persist；这里必须同时回滚内存和磁盘去重键，否则同一批重拉后会被跳过。
+          batchDone = false;
+          const failedKey = msg && msg.seq != null ? "s" + msg.seq
+            : (msg && msg.message_id != null ? "m" + msg.message_id : "");
+          if (failedKey && Array.isArray(il.recentSeqs)) {
+            il.recentSeqs = il.recentSeqs.filter((key) => key !== failedKey);
+          }
+          try { await this.persist(); }
+          catch (persistError) { console.error("[wechat-diary] 回滚失败消息去重键未能落盘:", persistError); }
+          console.error("[wechat-diary] 处理消息失败，保留游标等待重试:", e);
+          break;
+        }
       }
       if (batchDone && !dead() && r.json.get_updates_buf) {
         il.buf = r.json.get_updates_buf;
@@ -5167,9 +7573,15 @@ class WechatDiaryPlugin extends Plugin {
     let hasText = false;
     let hasVoice = false;
     const images = [], voices = [], files = [], videos = [];
+    const quoted = [], unknownItems = [];
     let voiceAudio = null;
     for (const item of msg.item_list || []) {
-      if (item.type === 1 && item.text_item) { text += item.text_item.text || ""; hasText = true; }
+      if (item.type === 1 && item.text_item) {
+        text += item.text_item.text || "";
+        hasText = true;
+        const ref = extractRefMessage(item.ref_msg || item.text_item.ref_msg);
+        if (ref && ref.text) quoted.push(quoteMarkdown(ref.text, "微信引用"));
+      }
       else if (item.type === 3 && item.voice_item) {
         hasVoice = true;
         const vt = item.voice_item.text || "";
@@ -5183,11 +7595,32 @@ class WechatDiaryPlugin extends Plugin {
       else if (item.type === 2 && item.image_item) { images.push(item.image_item); }
       else if (item.type === 4 && item.file_item) { files.push(item.file_item); }   // D10: 文件照收
       else if (item.type === 5 && item.video_item) { videos.push(item.video_item); } // D10: 视频照收
+      else if (!ILINK_INTERNAL_ITEM_TYPES.has(Number(item && item.type))) { unknownItems.push(item); }
     }
-    if (!hasText && !hasVoice && !images.length && !files.length && !videos.length) return; // 未知类型仍忽略
+    // 引用内容属于用户明确发送的消息，作为同一日记块保存；普通文字始终排在引用前面。
+    if (quoted.length) {
+      text = [compactQuotedText(text), ...quoted].filter(Boolean).join("\n\n");
+      hasText = true;
+    }
+    // 腾讯没有为公众号卡片、合并聊天记录等提供稳定 item 类型。只要它确实下发了
+    // 未知用户 item，就写一个可见占位并留下脱敏结构摘要，避免推进游标后静默消失。
+    let unsupported = false;
+    if (unknownItems.length) {
+      unsupported = true;
+      if (!Array.isArray(this.data.unknownMessages)) this.data.unknownMessages = [];
+      this.data.unknownMessages.push(unknownMessageSummary(msg, unknownItems));
+      if (this.data.unknownMessages.length > UNKNOWN_MESSAGE_HISTORY_LIMIT) {
+        this.data.unknownMessages.splice(0, this.data.unknownMessages.length - UNKNOWN_MESSAGE_HISTORY_LIMIT);
+      }
+      text = [compactQuotedText(text), "[暂不支持的微信内容，请复制文字或链接后重新发送]"].filter(Boolean).join("\n\n");
+      hasText = true;
+      console.warn("[wechat-diary] 收到暂不支持的微信 item:", this.data.unknownMessages[this.data.unknownMessages.length - 1]);
+    }
+    if (!hasText && !hasVoice && !images.length && !files.length && !videos.length) return; // 仅协议内部 item 不入库
     const isVoice = hasVoice && !hasText;
 
-    const reply = await this.agent.onMessage(from, text, isVoice, images, { voices, files, videos, voiceAudio });
+    let reply = await this.agent.onMessage(from, text, isVoice, images, { voices, files, videos, voiceAudio });
+    if (unsupported) reply = reply ? reply + "\n\n" + UNSUPPORTED_FORWARD_REPLY : UNSUPPORTED_FORWARD_REPLY;
     if (reply && from) {
       // 冷却期不出站(官方 assertSessionActive 语义): 日记已写入, 只是确认回执发不出
       if (this._isPaused() || !this._client) return;
@@ -5255,8 +7688,18 @@ WechatDiaryPlugin.__internals = {
   parseImageAesKey, sniffImageExt, decryptAesEcb,
   INTENT, texts: { HELP_TEXT, NIGHT_SIGNOFF_TIP, FIRST_OF_DAY_PREFIX, FIRST_OF_DAY_TIPS, FIRST_OF_DAY_TIPS_NIGHT, FINALIZE_EMPTY_REPLY, FINALIZE_FAIL_REPLY, GRACE_EXPIRED_NOTICE, CLOSING_MARKER },
   pingReply, welcomeText, undoOkReply, logicalTodayStr, setDayStartHour, isNightNow, canMergeIntoLastHeader,
-  isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter,
+  isUndoPhrase, signoffReply, nightSignoffTip, setNudgeNightHour, isLateNight, DiaryWriter, DiaryAgent,
   reminderDue, reminderText, sniffAudioExt, md5Hex, pcmToWav, silkToWav, getSilkLib,
+  // #15 路径层与共用文件模式
+  renderPath, validatePathFormat, normalizeHeading, escapeRegExp, locateSection, spliceSection, appendSection,
+  normalizeNewlines, trimBody, escapeHeadingLines, escapeFenceLines, renderTemplate, isForeignFile, removeLastBlock, sealContent,
+  firstOfDayPrefixShared, stripFirstPrefix, expiredNoticeShared, welcomeTextShared, helpText, UNDO_FOREIGN_REPLY,
+  DEFAULT_SETTINGS,
+  normalizeWebUrl, extractWebUrls, linkNoteFromText, isUnsafeWebUrl, extractArticleFromHtml,
+  defaultWebClipFolder, isWechatArticleUrl, isWechatShortJumpUrl, classifyWechatJumpLocation, shouldClipWebUrl, escapeWebText, webClipIdentityUrl,
+  safeClipFilename, formatWebClipMarkdown, requestWebClipBinaryDirect, webClipMaxImages, webClipMaxTotalImageBytes, WebClipper, WebClipError,
+  extractRefMessage, quoteMarkdown, unknownMessageSummary, UNSUPPORTED_FORWARD_REPLY,
+  BOT_AGENT,
   texts2: { REMINDER_LINES, FILE_DUP_KEY_REPLY, FILE_TOO_BIG_REPLY, VOICE_FALLBACK_FAIL_REPLY,
     VIDEO_DUP_KEY_REPLY, VIDEO_TOO_BIG_REPLY, ATTACH_DISK_FULL_REPLY, REMINDER_TIME_RE },
 };
